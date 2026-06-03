@@ -51,7 +51,7 @@ if question or uploaded_file:
      if uploaded_file:
         import base64
 
-        image_base64 = base64.b64encode(uploaded_file.getvalue()).decode("utf-8")
+          image_base64 = base64.b64encode(uploaded_file.getvalue()).decode("utf-8")
 
           user_message = {
     "role": "user",
