@@ -57,6 +57,10 @@ if question or uploaded_file:
             "role": "user",
             "content": [
                 {"type": "text", "text": question},
+           user_message = {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": question},
                 {
                     "type": "image_url",
                     "image_url": {
@@ -65,15 +69,15 @@ if question or uploaded_file:
                 }
             ]
         }
-else:
+
+    else:
         user_message = {
             "role": "user",
             "content": question
         }
-st.session_state.messages.append(
-        {"role": "user", "content": question}
-    )
 
+    st.session_state.messages.append(user_message)
+    st.chat_message("user").write(question)
 st.chat_message("user").write(question)
 
 safe_messages = [
