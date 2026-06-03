@@ -75,17 +75,18 @@ else:
         "role": "user",
         "content": question
     }
-                "url": f"data:image/jpeg;base64,{image_base64}"
-            }
-        }
-    ]
-}
+if uploaded_file:
+    ...
+    user_message = {
+        ...
+    }
+else:
+    user_message = {
+        "role": "user",
+        "content": question
+    }
 
-    else:
-        user_message = {
-            "role": "user",
-            "content": question
-        }
+st.session_state.messages.append(user_message)
 
     st.session_state.messages.append(user_message)
     st.chat_message("user").write(question)
