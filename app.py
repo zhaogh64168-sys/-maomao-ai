@@ -7,7 +7,6 @@ client = OpenAI(
 st.title("🤖毛毛AI超级助手")
 st.caption("基于GPT构建的个人AI助手")
 
-st.write("测试：下面应该出现上传按钮")
 uploaded_file = st.file_uploader("上传图片", type=["png", "jpg", "jpeg"], key="image_upload")
 
 if uploaded_file:
