@@ -42,8 +42,6 @@ for msg in st.session_state.messages:
         continue
     st.chat_message(msg["role"]).write(msg["content"])
 
-    uploaded_file = st.file_uploader("上传图片", type=["png", "jpg", "jpeg"])
-
 question = st.chat_input("请输入问题")
 
 if question or uploaded_file:
