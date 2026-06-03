@@ -48,21 +48,33 @@ if question or uploaded_file:
      if not question:
       question = "请分析这张图片"
 
-     if uploaded_file:
-        import base64
+if uploaded_file:
+    import base64
 
-    image_base64 = base64.b64encode(uploaded_file.getvalue()).decode("utf-8")
+    image_base64 = base64.b64encode(
+        uploaded_file.getvalue()
+    ).decode("utf-8")
 
     user_message = {
-    "role": "user",
-    "content": [
-        {
-            "type": "text",
-            "text": question
-        },
-        {
-            "type": "image_url",
-            "image_url": {
+        "role": "user",
+        "content": [
+            {
+                "type": "text",
+                "text": question
+            },
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:image/jpeg;base64,{image_base64}"
+                }
+            }
+        ]
+    }
+else:
+    user_message = {
+        "role": "user",
+        "content": question
+    }
                 "url": f"data:image/jpeg;base64,{image_base64}"
             }
         }
