@@ -1,4 +1,21 @@
 import streamlit as st
+
+PASSWORD = "maomao123"
+
+if "login" not in st.session_state:
+    st.session_state.login = False
+
+if not st.session_state.login:
+    pwd = st.text_input("请输入访问密码", type="password")
+
+    if st.button("登录"):
+        if pwd == PASSWORD:
+            st.session_state.login = True
+            st.rerun()
+        else:
+            st.error("密码错误")
+
+    st.stop()
 from openai import OpenAI
 import base64
 client = OpenAI(
