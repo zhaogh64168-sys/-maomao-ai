@@ -1,6 +1,6 @@
 import streamlit as st
 
-PASSWORD = "200202"
+PASSWORD = st.secrets["APP_PASSWORD"]
 
 if "login" not in st.session_state:
     st.session_state.login = False
