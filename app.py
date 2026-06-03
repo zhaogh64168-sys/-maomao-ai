@@ -75,18 +75,7 @@ else:
         "role": "user",
         "content": question
     }
-if uploaded_file:
-    ...
-    user_message = {
-        ...
-    }
-else:
-    user_message = {
-        "role": "user",
-        "content": question
-    }
 
-st.session_state.messages.append(user_message)
 
     st.session_state.messages.append(user_message)
     st.chat_message("user").write(question)
@@ -108,4 +97,3 @@ st.session_state.messages.append(
         {"role": "assistant", "content": answer}
     )
 
-st.chat_message("assistant").write(answer)
