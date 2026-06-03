@@ -44,42 +44,45 @@ for msg in st.session_state.messages:
 question = st.chat_input("请输入问题")
 
 if question or uploaded_file:
-     
-     if not question:
-      question = "请分析这张图片"
+    if not question:
+        question = "请分析这张图片"
 
-if uploaded_file:
-    import base64
+    if uploaded_file:
+        image_base64 = base64.b64encode(uploaded_file.getvalue()).decode("utf-8")
 
-    image_base64 = base64.b64encode(
-        uploaded_file.getvalue()
-    ).decode("utf-8")
-
-    user_message = {
-        "role": "user",
-        "content": [
-            {
-                "type": "text",
-                "text": question
-            },
-            {
-                "type": "image_url",
-                "image_url": {
-                    "url": f"data:image/jpeg;base64,{image_base64}"
+        user_message = {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": question},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/jpeg;base64,{image_base64}"
+                    }
                 }
-            }
-        ]
-    }
-else:
-    user_message = {
-        "role": "user",
-        "content": question
-    }
-
+            ]
+        }
+    else:
+        user_message = {
+            "role": "user",
+            "content": question
+        }
 
     st.session_state.messages.append(user_message)
     st.chat_message("user").write(question)
-st.chat_message("user").write(question)
+
+    response = client.chat.completions.create(
+        model="gpt-4.1-mini",
+        messages=st.session_state.messages
+    )
+
+    answer = response.choices[0].message.content
+
+    st.session_state.messages.append(
+        {"role": "assistant", "content": answer}
+    )
+
+    st.chat_message("assistant").write(answer)
 
 safe_messages = [
     msg for msg in st.session_state.messages
