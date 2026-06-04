@@ -1,5 +1,5 @@
 import streamlit as st
-
+import requests
 PASSWORD = st.secrets["APP_PASSWORD"]
 
 if "login" not in st.session_state:
@@ -21,6 +21,27 @@ import base64
 client = OpenAI(
     api_key=st.secrets["OPENAI_API_KEY"]
 )
+SUPABASE_URL = st.secrets["SUPABASE_URL"]
+SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
+
+def save_message(user_id, role, content):
+    url = f"{SUPABASE_URL}/rest/v1/chat_history"
+
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    data = {
+        "user_id": user_id,
+        "role": role,
+        "content": content
+    }
+
+    requests.post(url, headers=headers, json=data)
+
+user_id = "maomao"
 st.title("🤖毛毛AI超级助手")
 st.caption("基于GPT构建的个人AI助手")
 
