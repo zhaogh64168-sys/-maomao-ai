@@ -119,7 +119,7 @@ if question or uploaded_file:
     st.session_state.messages.append(
         {"role": "assistant", "content": answer}
     )
-
+save_message(user_id, "assistant", answer)
     st.chat_message("assistant").write(answer)
 
 safe_messages = [
@@ -137,4 +137,4 @@ answer = response.choices[0].message.content
 st.session_state.messages.append(
         {"role": "assistant", "content": answer}
     )
-
+save_message(user_id, "assistant", answer)
