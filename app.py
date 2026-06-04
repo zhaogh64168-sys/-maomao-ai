@@ -46,13 +46,13 @@ def save_message(user_id, role, content):
         "content": str(content)
     }
 
-r = requests.post(url, headers=headers, json=data)
-
-if r.status_code not in [200, 201]:
-    st.error(f"Supabase保存失败：{r.status_code}")
-    st.write(r.text)
-else:
-    st.success("聊天记录已保存")
+    r = requests.post(url, headers=headers, json=data)
+    
+    if r.status_code not in [200, 201]:
+        st.error(f"Supabase保存失败：{r.status_code}")
+        st.write(r.text)
+    else:
+        st.success("聊天记录已保存")
 
 
 def load_messages(user_id):
