@@ -112,6 +112,7 @@ model_name = st.selectbox(
 st.success(f"当前模型：{model_name}")
 
 if "messages" not in st.session_state:
+
     history = load_messages(user_id)
 
     if history:
@@ -121,6 +122,7 @@ if "messages" not in st.session_state:
                 "content": "你是毛毛AI超级助手，回答要简洁、实用、中文优先。"
             }
         ] + history
+
     else:
         st.session_state.messages = [
             {
