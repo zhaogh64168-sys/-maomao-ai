@@ -174,8 +174,8 @@ if question or uploaded_file:
     save_message(user_id, "user", save_content)
 
     st.chat_message("user").write(question)
-
-       response = client.chat.completions.create(
+    
+    response = client.chat.completions.create(
         model=model_name,
         messages=st.session_state.messages
     )
