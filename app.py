@@ -1,5 +1,8 @@
 import streamlit as st
 import requests
+import base64
+from openai import OpenAI
+
 PASSWORD = st.secrets["APP_PASSWORD"]
 
 if "login" not in st.session_state:
@@ -16,13 +19,16 @@ if not st.session_state.login:
             st.error("密码错误")
 
     st.stop()
-from openai import OpenAI
-import base64
+
 client = OpenAI(
     api_key=st.secrets["OPENAI_API_KEY"]
 )
+
 SUPABASE_URL = st.secrets["SUPABASE_URL"]
 SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
+
+user_id = "maomao"
+
 
 def save_message(user_id, role, content):
     url = f"{SUPABASE_URL}/rest/v1/chat_history"
@@ -30,51 +36,104 @@ def save_message(user_id, role, content):
     headers = {
         "apikey": SUPABASE_KEY,
         "Authorization": f"Bearer {SUPABASE_KEY}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "Prefer": "return=minimal"
     }
 
     data = {
         "user_id": user_id,
         "role": role,
-        "content": content
+        "content": str(content)
     }
 
     requests.post(url, headers=headers, json=data)
 
-user_id = "maomao"
+
+def load_messages(user_id):
+    url = f"{SUPABASE_URL}/rest/v1/chat_history?user_id=eq.{user_id}&order=id.asc"
+
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}"
+    }
+
+    res = requests.get(url, headers=headers)
+
+    if res.status_code != 200:
+        return []
+
+    rows = res.json()
+
+    return [
+        {
+            "role": row["role"],
+            "content": row["content"]
+        }
+        for row in rows
+    ]
+
+
+def clear_messages(user_id):
+    url = f"{SUPABASE_URL}/rest/v1/chat_history?user_id=eq.{user_id}"
+
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}"
+    }
+
+    requests.delete(url, headers=headers)
+
+
 st.title("🤖毛毛AI超级助手")
 st.caption("基于GPT构建的个人AI助手")
 
-uploaded_file = st.file_uploader("上传图片", type=["png", "jpg", "jpeg"], key="image_upload")
+uploaded_file = st.file_uploader(
+    "上传图片",
+    type=["png", "jpg", "jpeg"],
+    key="image_upload"
+)
 
 if uploaded_file:
     st.image(uploaded_file, caption="已上传图片", width=300)
 
 model_name = st.selectbox(
-
     "选择AI模型",
     [
-        "gpt-5.5",
-        "gpt-5.4",
-        "gpt-5.4-mini"
+        "gpt-4.1-mini"
     ]
 )
 
 st.success(f"当前模型：{model_name}")
 
-if st.button("🗑️清空聊天记录"):
-    st.session_state.messages = []
-    st.rerun()
-
 if "messages" not in st.session_state:
+    history = load_messages(user_id)
+
+    if history:
+        st.session_state.messages = [
+            {
+                "role": "system",
+                "content": "你是毛毛AI超级助手，回答要简洁、实用、中文优先。"
+            }
+        ] + history
+    else:
+        st.session_state.messages = [
+            {
+                "role": "system",
+                "content": "你是毛毛AI超级助手，回答要简洁、实用、中文优先。"
+            }
+        ]
+
+if st.button("🗑️清空聊天记录"):
+    clear_messages(user_id)
     st.session_state.messages = [
         {
             "role": "system",
             "content": "你是毛毛AI超级助手，回答要简洁、实用、中文优先。"
         }
     ]
+    st.rerun()
 
-for msg in st.session_state.messages:  
+for msg in st.session_state.messages:
     if msg["role"] == "system":
         continue
     st.chat_message(msg["role"]).write(msg["content"])
@@ -100,17 +159,24 @@ if question or uploaded_file:
                 }
             ]
         }
+
+        save_content = question + "【已上传图片】"
+
     else:
         user_message = {
             "role": "user",
             "content": question
         }
 
+        save_content = question
+
     st.session_state.messages.append(user_message)
+    save_message(user_id, "user", save_content)
+
     st.chat_message("user").write(question)
 
     response = client.chat.completions.create(
-        model="gpt-4.1-mini",
+        model=model_name,
         messages=st.session_state.messages
     )
 
@@ -119,22 +185,7 @@ if question or uploaded_file:
     st.session_state.messages.append(
         {"role": "assistant", "content": answer}
     )
-save_message(user_id, "assistant", answer)
+
+    save_message(user_id, "assistant", answer)
+
     st.chat_message("assistant").write(answer)
-
-safe_messages = [
-    msg for msg in st.session_state.messages
-    if msg.get("content") is not None
-]
-
-response = client.chat.completions.create(
-    model=model_name,
-    messages=safe_messages
-)
-
-answer = response.choices[0].message.content
-
-st.session_state.messages.append(
-        {"role": "assistant", "content": answer}
-    )
-save_message(user_id, "assistant", answer)
