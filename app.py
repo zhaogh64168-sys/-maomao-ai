@@ -105,8 +105,13 @@ if uploaded_file:
 model_name = st.selectbox(
     "选择AI模型",
     [
+        "gpt-5",
+        "gpt-5-mini",
+        "gpt-5-nano",
+        "gpt-4.1",
         "gpt-4.1-mini"
-    ]
+    ],
+    index=1
 )
 
 st.success(f"当前模型：{model_name}")
