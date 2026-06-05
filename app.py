@@ -29,6 +29,7 @@ SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
 
 user_id = "maomao"
 
+memories = load_memories(user_id)
 
 def save_message(user_id, role, content):
     url = f"{SUPABASE_URL}/rest/v1/chat_history"
@@ -51,6 +52,38 @@ def save_message(user_id, role, content):
     if r.status_code not in [200, 201]:
         st.error(f"Supabase保存失败：{r.status_code}")
         st.write(r.text)
+
+def save_memory(user_id, memory):
+    url = f"{SUPABASE_URL}/rest/v1/memories"
+
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    data = {
+        "user_id": user_id,
+        "memory": memory
+    }
+
+    requests.post(url, headers=headers, json=data)
+
+
+def load_memories(user_id):
+    url = f"{SUPABASE_URL}/rest/v1/memories?user_id=eq.{user_id}"
+
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}"
+    }
+
+    res = requests.get(url, headers=headers)
+
+    if res.status_code == 200:
+        return [x["memory"] for x in res.json()]
+
+    return []
 
 def load_messages(user_id):
     url = f"{SUPABASE_URL}/rest/v1/chat_history?user_id=eq.{user_id}&order=id.asc"
@@ -118,27 +151,48 @@ if "messages" not in st.session_state:
 
     if history:
         st.session_state.messages = [
-            {
-                "role": "system",
-                "content": "你是毛毛AI超级助手，回答要简洁、实用、中文优先。"
-            }
+           {
+    "role": "system",
+    "content": f"""
+你是毛毛AI超级助手。
+
+已知用户长期记忆：
+{chr(10).join(memories)}
+
+回答要简洁、实用、中文优先。
+"""
+}
         ] + history
 
     else:
         st.session_state.messages = [
-            {
-                "role": "system",
-                "content": "你是毛毛AI超级助手，回答要简洁、实用、中文优先。"
-            }
+         {
+    "role": "system",
+    "content": f"""
+你是毛毛AI超级助手。
+
+已知用户长期记忆：
+{chr(10).join(memories)}
+
+回答要简洁、实用、中文优先。
+"""
+}
         ]
 
 if st.button("🗑️清空聊天记录"):
     clear_messages(user_id)
     st.session_state.messages = [
-        {
-            "role": "system",
-            "content": "你是毛毛AI超级助手，回答要简洁、实用、中文优先。"
-        }
+      {
+    "role": "system",
+    "content": f"""
+你是毛毛AI超级助手。
+
+已知用户长期记忆：
+{chr(10).join(memories)}
+
+回答要简洁、实用、中文优先。
+"""
+}
     ]
     st.rerun()
 
