@@ -106,12 +106,9 @@ model_name = st.selectbox(
     "选择AI模型",
     [
         "gpt-5.5",
-        "gpt-5.5-pro",
         "gpt-5.4",
-        "gpt-5.4-pro",
         "gpt-5.4-mini",
         "gpt-5.4-nano",
-        "gpt-5.3-codex",
     ],
     index=0
 )
