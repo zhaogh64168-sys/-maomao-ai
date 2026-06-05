@@ -51,9 +51,6 @@ def save_message(user_id, role, content):
     if r.status_code not in [200, 201]:
         st.error(f"Supabase保存失败：{r.status_code}")
         st.write(r.text)
-    else:
-        st.success("聊天记录已保存")
-
 
 def load_messages(user_id):
     url = f"{SUPABASE_URL}/rest/v1/chat_history?user_id=eq.{user_id}&order=id.asc"
