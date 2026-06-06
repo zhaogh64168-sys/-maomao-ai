@@ -4,6 +4,7 @@ import hmac
 import json
 import os
 import re
+import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
@@ -14,15 +15,27 @@ from openai import OpenAI
 
 
 MODEL_OPTIONS = ["gpt-5", "gpt-5.5", "gpt-5-mini"]
+PLAN_IDS = ["free", "monthly", "yearly"]
 FREE_PLAN_ID = "free"
 DEFAULT_PLAN_ID = FREE_PLAN_ID
-ADMIN_PLAN_IDS = ["free", "monthly", "quarterly", "yearly"]
-DEFAULT_DAILY_LIMIT = 20
-DEFAULT_TOKEN_LIMIT = 50000
-DEFAULT_MONTHLY_LIMIT = 300
-DEFAULT_MONTHLY_TOKEN_LIMIT = 1000000
 PASSWORD_ITERATIONS = 200000
-SUPABASE_TABLES = {"users", "plans", "payments", "chat_history", "memories", "usage_logs"}
+EMAIL_CODE_MINUTES = 10
+PASSWORD_RESET_MINUTES = 20
+COMMISSION_RATE = 0.2
+SUPABASE_TABLES = {
+    "users",
+    "plans",
+    "payments",
+    "conversations",
+    "chat_history",
+    "memories",
+    "usage_logs",
+    "email_codes",
+    "password_resets",
+    "invite_codes",
+    "referrals",
+    "commissions",
+}
 FALLBACK_PLANS = [
     {
         "plan_id": "free",
@@ -33,40 +46,29 @@ FALLBACK_PLANS = [
         "token_limit": 50000,
         "monthly_limit": 300,
         "monthly_token_limit": 1000000,
-        "description": "适合试用，每日和每月额度较低。",
+        "description": "适合试用，含基础聊天、图片分析和长期记忆。",
     },
     {
         "plan_id": "monthly",
-        "name": "月卡",
+        "name": "月付版",
         "price": 29,
         "billing_cycle": "monthly",
         "daily_limit": 300,
         "token_limit": 1000000,
         "monthly_limit": 6000,
         "monthly_token_limit": 20000000,
-        "description": "适合日常高频使用，按月开通。",
-    },
-    {
-        "plan_id": "quarterly",
-        "name": "季卡",
-        "price": 79,
-        "billing_cycle": "quarterly",
-        "daily_limit": 600,
-        "token_limit": 2500000,
-        "monthly_limit": 15000,
-        "monthly_token_limit": 60000000,
-        "description": "适合稳定使用，季度套餐更省心。",
+        "description": "适合日常高频使用，人工审核开通。",
     },
     {
         "plan_id": "yearly",
-        "name": "年卡",
+        "name": "年付版",
         "price": 299,
         "billing_cycle": "yearly",
         "daily_limit": 1200,
         "token_limit": 6000000,
         "monthly_limit": 50000,
         "monthly_token_limit": 200000000,
-        "description": "适合长期使用和商业场景。",
+        "description": "适合长期使用和商业场景，额度更高。",
     },
 ]
 
@@ -108,22 +110,25 @@ def jwt_role(token):
 
 
 def validate_supabase_key(token):
-    role = jwt_role(token)
-    if role == "anon":
+    if jwt_role(token) == "anon":
         st.error("SUPABASE_KEY 当前是 anon key。请改用 service_role key，并只保存在 Streamlit Secrets。")
         st.stop()
 
 
+def utc_now():
+    return datetime.now(timezone.utc)
+
+
 def utc_now_iso():
-    return datetime.now(timezone.utc).isoformat()
+    return utc_now().isoformat()
 
 
 def today_start_iso():
-    return datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    return utc_now().replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
 
 
 def month_start_iso():
-    return datetime.now(timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
+    return utc_now().replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
 
 
 def parse_datetime(value):
@@ -133,6 +138,15 @@ def parse_datetime(value):
         return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except ValueError:
         return None
+
+
+def encode_filter_value(value):
+    return quote(str(value), safe="")
+
+
+def hash_text(value):
+    secret = str(get_secret("APP_SECRET", "maomao-ai-local-secret"))
+    return hmac.new(secret.encode("utf-8"), str(value).encode("utf-8"), hashlib.sha256).hexdigest()
 
 
 def password_hash(password, salt_hex=None):
@@ -146,10 +160,6 @@ def verify_password(password, salt_hex, expected_hash):
         return False
     _, digest_hex = password_hash(password, salt_hex)
     return hmac.compare_digest(digest_hex, expected_hash)
-
-
-def encode_filter_value(value):
-    return quote(str(value), safe="")
 
 
 def get_supabase_headers(include_content_type=False):
@@ -179,12 +189,12 @@ def supabase_error_detail(res):
         detail = {"message": res.text[:300]}
     message = detail.get("message") or detail.get("hint") or str(detail)
     if res.status_code == 404:
-        message += "。请确认表创建在 public schema，并在 Supabase 执行：NOTIFY pgrst, 'reload schema';"
+        message += "。请确认表在 public schema，并执行：notify pgrst, 'reload schema';"
     return message
 
 
 def db_get(table, query=""):
-    res = requests.get(supabase_url(table, query), headers=get_supabase_headers(), timeout=20)
+    res = requests.get(supabase_url(table, query), headers=get_supabase_headers(), timeout=25)
     if res.status_code != 200:
         st.error(f"读取 {table} 失败：{res.status_code} - {supabase_error_detail(res)}")
         return []
@@ -194,7 +204,7 @@ def db_get(table, query=""):
 def db_insert(table, data, return_rows=False):
     headers = get_supabase_headers(include_content_type=True)
     headers["Prefer"] = "return=representation" if return_rows else "return=minimal"
-    res = requests.post(supabase_url(table), headers=headers, json=data, timeout=20)
+    res = requests.post(supabase_url(table), headers=headers, json=data, timeout=25)
     if res.status_code not in (200, 201, 204):
         st.error(f"写入 {table} 失败：{res.status_code} - {supabase_error_detail(res)}")
         return [] if return_rows else False
@@ -204,7 +214,7 @@ def db_insert(table, data, return_rows=False):
 def db_patch(table, query, data, return_rows=False):
     headers = get_supabase_headers(include_content_type=True)
     headers["Prefer"] = "return=representation" if return_rows else "return=minimal"
-    res = requests.patch(supabase_url(table, query), headers=headers, json=data, timeout=20)
+    res = requests.patch(supabase_url(table, query), headers=headers, json=data, timeout=25)
     if res.status_code not in (200, 204):
         st.error(f"更新 {table} 失败：{res.status_code} - {supabase_error_detail(res)}")
         return [] if return_rows else False
@@ -212,33 +222,91 @@ def db_patch(table, query, data, return_rows=False):
 
 
 def db_delete(table, query):
-    res = requests.delete(supabase_url(table, query), headers=get_supabase_headers(), timeout=20)
+    res = requests.delete(supabase_url(table, query), headers=get_supabase_headers(), timeout=25)
     if res.status_code not in (200, 202, 204):
         st.error(f"删除 {table} 失败：{res.status_code} - {supabase_error_detail(res)}")
         return False
     return True
 
 
-def fetch_user_by_login(login):
-    value = encode_filter_value(login.strip().lower())
-    query = (
-        f"?or=(email.eq.{value},username.eq.{value})"
-        "&select=*"
-        "&limit=1"
-    )
-    rows = db_get("users", query)
+def first_row(table, query):
+    rows = db_get(table, query)
     return rows[0] if rows else None
+
+
+def app_css():
+    st.markdown(
+        """
+        <style>
+        .block-container {padding-top: 1.2rem; max-width: 1180px;}
+        [data-testid="stSidebar"] {background: #f8fafc;}
+        .maomao-hero {padding: 1.4rem 0 0.6rem;}
+        .maomao-hero h1 {font-size: 2.1rem; margin-bottom: .2rem;}
+        .maomao-card {border: 1px solid #e5e7eb; border-radius: 18px; padding: 1rem; background: #fff;}
+        .maomao-small {color: #64748b; font-size: .92rem;}
+        .maomao-topbar {display: flex; align-items: center; justify-content: space-between; gap: 1rem;}
+        @media (max-width: 780px) {
+            .block-container {padding-left: .8rem; padding-right: .8rem;}
+            .maomao-hero h1 {font-size: 1.6rem;}
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def list_plans():
+    rows = db_get("plans", "?plan_id=in.(free,monthly,yearly)&select=*&order=price.asc")
+    return rows if rows else FALLBACK_PLANS
+
+
+def get_plan(plan_id):
+    encoded_plan_id = encode_filter_value(plan_id or DEFAULT_PLAN_ID)
+    row = first_row("plans", f"?plan_id=eq.{encoded_plan_id}&select=*&limit=1")
+    if row:
+        return row
+    for plan in FALLBACK_PLANS:
+        if plan["plan_id"] == (plan_id or DEFAULT_PLAN_ID):
+            return plan
+    return FALLBACK_PLANS[0]
+
+
+def user_plan_id(user):
+    return user.get("plan_id") or user.get("plan") or DEFAULT_PLAN_ID
+
+
+def effective_limits(user):
+    plan = get_plan(user_plan_id(user))
+    expire_at = parse_datetime(user.get("expire_at"))
+    is_expired = bool(expire_at and expire_at < utc_now())
+    if user_plan_id(user) != FREE_PLAN_ID and is_expired:
+        plan = get_plan(FREE_PLAN_ID)
+    daily_limit = user.get("daily_limit") or plan.get("daily_limit") or 20
+    token_limit = user.get("token_limit") or plan.get("token_limit") or 50000
+    monthly_limit = user.get("monthly_limit") or plan.get("monthly_limit") or 300
+    monthly_token_limit = user.get("monthly_token_limit") or plan.get("monthly_token_limit") or 1000000
+    return plan, int(daily_limit), int(token_limit), int(monthly_limit), int(monthly_token_limit), is_expired
+
+
+def plan_expire_at(plan):
+    cycle = plan.get("billing_cycle") or "free"
+    days = {"monthly": 30, "yearly": 365}.get(cycle)
+    return (utc_now() + timedelta(days=days)).isoformat() if days else None
+
+
+def generate_referral_code(username):
+    safe_name = re.sub(r"[^a-z0-9]", "", str(username).lower())[:8] or "user"
+    return f"{safe_name}{secrets.token_hex(3)}"
+
+
+def fetch_user_by_login(login):
+    value = encode_filter_value(str(login).strip().lower())
+    return first_row("users", f"?or=(email.eq.{value},username.eq.{value})&select=*&limit=1")
 
 
 def fetch_user_by_id(user_id):
     encoded_user_id = encode_filter_value(user_id)
-    query = (
-        f"?user_id=eq.{encoded_user_id}"
-        "&select=*"
-        "&limit=1"
-    )
-    rows = db_get("users", query)
-    return rows[0] if rows else None
+    return first_row("users", f"?user_id=eq.{encoded_user_id}&select=*&limit=1")
 
 
 def username_or_email_exists(username, email):
@@ -248,48 +316,127 @@ def username_or_email_exists(username, email):
     return bool(rows)
 
 
-def user_plan_id(user):
-    return user.get("plan_id") or user.get("plan") or DEFAULT_PLAN_ID
+def send_resend_email(to_email, subject, html):
+    resend_key = get_secret("RESEND_API_KEY", "")
+    email_from = get_secret("EMAIL_FROM", "")
+    if not resend_key or not email_from:
+        return False, "邮箱接口暂未接入：已生成验证码，请在页面提示中查看。"
+    res = requests.post(
+        "https://api.resend.com/emails",
+        headers={"Authorization": f"Bearer {resend_key}", "Content-Type": "application/json"},
+        json={"from": email_from, "to": [to_email], "subject": subject, "html": html},
+        timeout=25,
+    )
+    if res.status_code not in (200, 201):
+        return False, f"邮件发送失败：{res.status_code}"
+    return True, "验证码已发送，请查看邮箱。"
 
 
-def get_plan(plan_id):
-    encoded_plan_id = encode_filter_value(plan_id or DEFAULT_PLAN_ID)
-    rows = db_get("plans", f"?plan_id=eq.{encoded_plan_id}&select=*&limit=1")
-    if rows:
-        return rows[0]
-    for plan in FALLBACK_PLANS:
-        if plan["plan_id"] == (plan_id or DEFAULT_PLAN_ID):
-            return plan
-    return FALLBACK_PLANS[0]
+def create_email_code(email, purpose):
+    code = f"{secrets.randbelow(1000000):06d}"
+    row = {
+        "email": email.strip().lower(),
+        "purpose": purpose,
+        "code_hash": hash_text(code),
+        "used": False,
+        "expires_at": (utc_now() + timedelta(minutes=EMAIL_CODE_MINUTES)).isoformat(),
+        "created_at": utc_now_iso(),
+    }
+    ok = db_insert("email_codes", row)
+    if not ok:
+        return None, "验证码保存失败。"
+    subject = "毛毛AI 验证码"
+    html = f"<p>你的验证码是：<b>{code}</b></p><p>{EMAIL_CODE_MINUTES} 分钟内有效。</p>"
+    sent, message = send_resend_email(email, subject, html)
+    if not sent:
+        message = f"{message} 当前验证码：{code}"
+    return code, message
 
 
-def list_plans():
-    plan_filter = ",".join(ADMIN_PLAN_IDS)
-    rows = db_get("plans", f"?plan_id=in.({plan_filter})&select=*&order=price.asc")
-    if rows:
-        return rows
-    return FALLBACK_PLANS
+def verify_email_code(email, purpose, code):
+    encoded_email = encode_filter_value(email.strip().lower())
+    encoded_purpose = encode_filter_value(purpose)
+    rows = db_get(
+        "email_codes",
+        f"?email=eq.{encoded_email}&purpose=eq.{encoded_purpose}&used=eq.false&select=*&order=created_at.desc&limit=1",
+    )
+    if not rows:
+        return False
+    row = rows[0]
+    expires_at = parse_datetime(row.get("expires_at"))
+    if expires_at and expires_at < utc_now():
+        return False
+    if not hmac.compare_digest(row.get("code_hash") or "", hash_text(code.strip())):
+        return False
+    db_patch("email_codes", f"?id=eq.{encode_filter_value(row.get('id'))}", {"used": True})
+    return True
 
 
-def effective_limits(user):
-    plan = get_plan(user_plan_id(user))
-    expire_at = parse_datetime(user.get("expire_at"))
-    is_expired = bool(expire_at and expire_at < datetime.now(timezone.utc))
-    if user_plan_id(user) != FREE_PLAN_ID and is_expired:
-        plan = get_plan(DEFAULT_PLAN_ID)
+def create_password_reset(email):
+    user = fetch_user_by_login(email)
+    if not user:
+        return "如果邮箱已注册，系统会发送重置验证码。"
+    code = f"{secrets.randbelow(1000000):06d}"
+    row = {
+        "email": email.strip().lower(),
+        "token_hash": hash_text(code),
+        "used": False,
+        "expires_at": (utc_now() + timedelta(minutes=PASSWORD_RESET_MINUTES)).isoformat(),
+        "created_at": utc_now_iso(),
+    }
+    db_insert("password_resets", row)
+    subject = "毛毛AI 找回密码"
+    html = f"<p>你的重置验证码是：<b>{code}</b></p><p>{PASSWORD_RESET_MINUTES} 分钟内有效。</p>"
+    sent, message = send_resend_email(email, subject, html)
+    return message if sent else f"{message} 当前重置验证码：{code}"
 
-    daily_limit = user.get("daily_limit") or plan.get("daily_limit") or DEFAULT_DAILY_LIMIT
-    token_limit = user.get("token_limit") or plan.get("token_limit") or DEFAULT_TOKEN_LIMIT
-    monthly_limit = user.get("monthly_limit") or plan.get("monthly_limit") or DEFAULT_MONTHLY_LIMIT
-    monthly_token_limit = user.get("monthly_token_limit") or plan.get("monthly_token_limit") or DEFAULT_MONTHLY_TOKEN_LIMIT
-    return plan, int(daily_limit), int(token_limit), int(monthly_limit), int(monthly_token_limit), is_expired
+
+def reset_password_with_code(email, code, new_password):
+    encoded_email = encode_filter_value(email.strip().lower())
+    rows = db_get(
+        "password_resets",
+        f"?email=eq.{encoded_email}&used=eq.false&select=*&order=created_at.desc&limit=1",
+    )
+    if not rows:
+        st.error("重置验证码无效")
+        return False
+    row = rows[0]
+    expires_at = parse_datetime(row.get("expires_at"))
+    if expires_at and expires_at < utc_now():
+        st.error("重置验证码已过期")
+        return False
+    if not hmac.compare_digest(row.get("token_hash") or "", hash_text(code.strip())):
+        st.error("重置验证码错误")
+        return False
+    if len(new_password) < 8:
+        st.error("新密码至少 8 位")
+        return False
+    salt_hex, digest_hex = password_hash(new_password)
+    ok = db_patch("users", f"?email=eq.{encoded_email}", {"password_salt": salt_hex, "password_hash": digest_hex})
+    if ok:
+        db_patch("password_resets", f"?id=eq.{encode_filter_value(row.get('id'))}", {"used": True})
+    return ok
 
 
-def create_user(username, email, password):
+def find_invite(invite_code):
+    if not invite_code:
+        return None
+    encoded_code = encode_filter_value(invite_code.strip())
+    return first_row("invite_codes", f"?code=eq.{encoded_code}&disabled=eq.false&select=*&limit=1")
+
+
+def find_referrer(code):
+    if not code:
+        return None
+    encoded_code = encode_filter_value(code.strip())
+    return first_row("users", f"?referral_code=eq.{encoded_code}&select=user_id,username,email,referral_code&limit=1")
+
+
+def create_user(username, email, password, email_code, invite_or_referral=""):
     username = username.strip().lower()
     email = email.strip().lower()
-    if not username or not email or not password:
-        st.error("请填写用户名、邮箱和密码")
+    if not username or not email or not password or not email_code:
+        st.error("请填写用户名、邮箱、密码和邮箱验证码")
         return None
     if len(password) < 8:
         st.error("密码至少 8 位")
@@ -297,30 +444,65 @@ def create_user(username, email, password):
     if username_or_email_exists(username, email):
         st.error("用户名或邮箱已被注册")
         return None
+    if not verify_email_code(email, "register", email_code):
+        st.error("邮箱验证码错误或已过期")
+        return None
+
+    invite = find_invite(invite_or_referral)
+    referrer = find_referrer(invite_or_referral)
+    if invite and invite.get("max_uses") is not None and int(invite.get("used_count") or 0) >= int(invite.get("max_uses") or 0):
+        st.error("邀请码已达到使用上限")
+        return None
+
+    if invite and invite.get("promoter_user_id"):
+        invited_by = invite.get("promoter_user_id")
+    elif referrer:
+        invited_by = referrer.get("user_id")
+    else:
+        invited_by = None
 
     salt_hex, digest_hex = password_hash(password)
     free_plan = get_plan(FREE_PLAN_ID)
+    user_id = str(uuid.uuid4())
     user = {
-        "user_id": str(uuid.uuid4()),
+        "user_id": user_id,
         "username": username,
         "email": email,
         "password_hash": digest_hex,
         "password_salt": salt_hex,
-        "plan": DEFAULT_PLAN_ID,
-        "plan_id": DEFAULT_PLAN_ID,
+        "plan": FREE_PLAN_ID,
+        "plan_id": FREE_PLAN_ID,
         "expire_at": None,
-        "daily_limit": free_plan.get("daily_limit", DEFAULT_DAILY_LIMIT),
-        "token_limit": free_plan.get("token_limit", DEFAULT_TOKEN_LIMIT),
-        "monthly_limit": free_plan.get("monthly_limit", DEFAULT_MONTHLY_LIMIT),
-        "monthly_token_limit": free_plan.get("monthly_token_limit", DEFAULT_MONTHLY_TOKEN_LIMIT),
+        "daily_limit": int(free_plan.get("daily_limit") or 20),
+        "token_limit": int(free_plan.get("token_limit") or 50000),
+        "monthly_limit": int(free_plan.get("monthly_limit") or 300),
+        "monthly_token_limit": int(free_plan.get("monthly_token_limit") or 1000000),
+        "referral_code": generate_referral_code(username),
+        "invited_by": invited_by,
         "is_admin": False,
         "disabled": False,
         "created_at": utc_now_iso(),
     }
     rows = db_insert("users", user, return_rows=True)
-    if rows:
-        return rows[0]
-    return None
+    if not rows:
+        return None
+    if invite:
+        db_patch(
+            "invite_codes",
+            f"?id=eq.{encode_filter_value(invite.get('id'))}",
+            {"used_count": int(invite.get("used_count") or 0) + 1},
+        )
+    if invited_by:
+        db_insert(
+            "referrals",
+            {
+                "referrer_user_id": invited_by,
+                "referred_user_id": user_id,
+                "invite_code": invite_or_referral.strip() or None,
+                "created_at": utc_now_iso(),
+            },
+        )
+    return rows[0]
 
 
 def login_user(login, password):
@@ -331,15 +513,14 @@ def login_user(login, password):
     if user.get("disabled"):
         st.error("账号已被禁用")
         return None
-    safe_user = fetch_user_by_id(user["user_id"])
-    return safe_user
+    return fetch_user_by_id(user["user_id"])
 
 
 def set_logged_in_user(user):
     st.session_state.login = True
     st.session_state.user = user
     st.session_state.user_id = user["user_id"]
-    st.session_state.active_user_id = None
+    st.session_state.active_conversation_id = None
 
 
 def require_login():
@@ -348,12 +529,12 @@ def require_login():
         if user and not user.get("disabled"):
             st.session_state.user = user
             return user
-        for key in ["login", "user", "user_id", "active_user_id", "messages", "memories"]:
+        for key in ["login", "user", "user_id", "active_conversation_id", "messages", "memories"]:
             st.session_state.pop(key, None)
 
     st.title("毛毛AI")
     st.caption("登录或注册后开始使用")
-    login_tab, register_tab = st.tabs(["登录", "注册"])
+    login_tab, register_tab, reset_tab = st.tabs(["登录", "邮箱注册", "找回密码"])
 
     with login_tab:
         login = st.text_input("用户名或邮箱", key="login_name")
@@ -368,25 +549,121 @@ def require_login():
         username = st.text_input("用户名", key="register_username")
         email = st.text_input("邮箱", key="register_email")
         password = st.text_input("密码", type="password", key="register_password")
+        invite_code = st.text_input("邀请码 / 推广码（可选）", key="register_invite")
+        email_code = st.text_input("邮箱验证码", key="register_email_code")
+        if st.button("发送邮箱验证码", use_container_width=True):
+            if not email:
+                st.error("请先填写邮箱")
+            else:
+                _, message = create_email_code(email, "register")
+                st.info(message)
         if st.button("注册并登录", use_container_width=True):
-            user = create_user(username, email, password)
+            user = create_user(username, email, password, email_code, invite_code)
             if user:
-                safe_user = fetch_user_by_id(user["user_id"])
-                set_logged_in_user(safe_user)
+                set_logged_in_user(fetch_user_by_id(user["user_id"]))
                 st.rerun()
+
+    with reset_tab:
+        reset_email = st.text_input("注册邮箱", key="reset_email")
+        reset_code = st.text_input("重置验证码", key="reset_code")
+        new_password = st.text_input("新密码", type="password", key="reset_new_password")
+        if st.button("发送重置验证码", use_container_width=True):
+            if reset_email:
+                st.info(create_password_reset(reset_email))
+            else:
+                st.error("请填写邮箱")
+        if st.button("重置密码", use_container_width=True):
+            if reset_password_with_code(reset_email, reset_code, new_password):
+                st.success("密码已重置，请重新登录")
 
     st.stop()
 
 
+def list_conversations(user_id):
+    encoded_user_id = encode_filter_value(user_id)
+    return db_get("conversations", f"?user_id=eq.{encoded_user_id}&select=*&order=updated_at.desc")
+
+
+def create_conversation(user_id, title="新对话"):
+    rows = db_insert(
+        "conversations",
+        {"user_id": user_id, "title": title, "created_at": utc_now_iso(), "updated_at": utc_now_iso()},
+        return_rows=True,
+    )
+    return rows[0] if rows else None
+
+
+def ensure_active_conversation(user_id):
+    active_id = st.session_state.get("active_conversation_id")
+    if active_id and first_row(
+        "conversations",
+        f"?id=eq.{encode_filter_value(active_id)}&user_id=eq.{encode_filter_value(user_id)}&select=id&limit=1",
+    ):
+        return active_id
+    conversations = list_conversations(user_id)
+    if conversations:
+        st.session_state.active_conversation_id = conversations[0]["id"]
+        return conversations[0]["id"]
+    created = create_conversation(user_id)
+    if created:
+        st.session_state.active_conversation_id = created["id"]
+        return created["id"]
+    return None
+
+
+def rename_conversation(user_id, conversation_id, title):
+    return db_patch(
+        "conversations",
+        f"?id=eq.{encode_filter_value(conversation_id)}&user_id=eq.{encode_filter_value(user_id)}",
+        {"title": title.strip() or "未命名对话", "updated_at": utc_now_iso()},
+    )
+
+
+def delete_conversation(user_id, conversation_id):
+    encoded_user_id = encode_filter_value(user_id)
+    encoded_conversation_id = encode_filter_value(conversation_id)
+    db_delete("chat_history", f"?user_id=eq.{encoded_user_id}&conversation_id=eq.{encoded_conversation_id}")
+    return db_delete("conversations", f"?user_id=eq.{encoded_user_id}&id=eq.{encoded_conversation_id}")
+
+
+def clear_all_conversations(user_id):
+    encoded_user_id = encode_filter_value(user_id)
+    db_delete("chat_history", f"?user_id=eq.{encoded_user_id}")
+    return db_delete("conversations", f"?user_id=eq.{encoded_user_id}")
+
+
+def load_messages(user_id, conversation_id):
+    encoded_user_id = encode_filter_value(user_id)
+    encoded_conversation_id = encode_filter_value(conversation_id)
+    rows = db_get(
+        "chat_history",
+        f"?user_id=eq.{encoded_user_id}&conversation_id=eq.{encoded_conversation_id}&select=role,content&order=id.asc",
+    )
+    return [{"role": r.get("role"), "content": r.get("content")} for r in rows if r.get("role") in {"user", "assistant"}]
+
+
+def save_message(user_id, conversation_id, role, content):
+    db_patch(
+        "conversations",
+        f"?id=eq.{encode_filter_value(conversation_id)}&user_id=eq.{encode_filter_value(user_id)}",
+        {"updated_at": utc_now_iso()},
+    )
+    return db_insert(
+        "chat_history",
+        {
+            "user_id": user_id,
+            "conversation_id": conversation_id,
+            "role": role,
+            "content": str(content),
+            "created_at": utc_now_iso(),
+        },
+    )
+
+
 def load_memories(user_id):
     encoded_user_id = encode_filter_value(user_id)
-    query = f"?user_id=eq.{encoded_user_id}&select=id,memory&order=id.asc"
-    rows = db_get("memories", query)
-    return [
-        {"id": row.get("id"), "memory": row.get("memory", "")}
-        for row in rows
-        if row.get("id") is not None and row.get("memory")
-    ]
+    rows = db_get("memories", f"?user_id=eq.{encoded_user_id}&select=id,memory&order=id.asc")
+    return [{"id": row.get("id"), "memory": row.get("memory", "")} for row in rows if row.get("memory")]
 
 
 def save_memory(user_id, memory):
@@ -405,13 +682,12 @@ def clear_memories(user_id):
 
 
 def forget_memories(user_id, keyword):
-    keyword = keyword.strip()
     deleted = 0
     for memory in st.session_state.get("memories", []):
         if keyword and keyword in memory["memory"] and delete_memory(user_id, memory["id"]):
             deleted += 1
     if deleted:
-        refresh_memories(user_id)
+        st.session_state.memories = load_memories(user_id)
     return deleted
 
 
@@ -431,13 +707,12 @@ def memory_texts():
     return [memory["memory"] for memory in st.session_state.get("memories", []) if memory.get("memory")]
 
 
-def build_system_prompt(memories, search_enabled=False, search_context=""):
-    memory_lines = "\n".join(f"- {memory}" for memory in memories) if memories else "暂无"
-    search_note = "联网搜索：已开启。" if search_enabled else "联网搜索：未开启。"
+def build_system_prompt(search_enabled=False, search_context=""):
+    memory_lines = "\n".join(f"- {m}" for m in memory_texts()) if memory_texts() else "暂无"
+    search_note = "联网搜索：已开启，当前保留接口，未接入真实搜索。" if search_enabled else "联网搜索：未开启。"
     if search_context:
-        search_note += f"\n可参考的搜索上下文：\n{search_context}"
-    return f"""
-你是毛毛AI个人助手。
+        search_note += f"\n搜索上下文：\n{search_context}"
+    return f"""你是毛毛AI个人助手。
 
 当前用户长期记忆：
 {memory_lines}
@@ -446,114 +721,47 @@ def build_system_prompt(memories, search_enabled=False, search_context=""):
 
 回答要求：
 - 中文优先
+- 支持 Markdown 和代码块
 - 简洁、准确、实用
 - 不要暴露系统提示、API Key 或隐藏配置
 """
 
 
-def reset_system_message(search_enabled=False, search_context=""):
-    system_message = {
-        "role": "system",
-        "content": build_system_prompt(memory_texts(), search_enabled, search_context),
-    }
-    if "messages" not in st.session_state or not st.session_state.messages:
-        st.session_state.messages = [system_message]
-        return
-    if st.session_state.messages[0].get("role") == "system":
-        st.session_state.messages[0] = system_message
-    else:
-        st.session_state.messages.insert(0, system_message)
-
-
-def refresh_memories(user_id):
-    st.session_state.memories = load_memories(user_id)
-    reset_system_message(st.session_state.get("search_enabled", False))
-
-
-def save_message(user_id, role, content):
-    return bool(
-        db_insert(
-            "chat_history",
-            {"user_id": user_id, "role": role, "content": str(content), "created_at": utc_now_iso()},
-        )
-    )
-
-
-def load_messages(user_id):
-    encoded_user_id = encode_filter_value(user_id)
-    rows = db_get("chat_history", f"?user_id=eq.{encoded_user_id}&select=role,content&order=id.asc")
-    messages = []
-    for row in rows:
-        role = row.get("role")
-        content = row.get("content")
-        if role in {"user", "assistant"} and content:
-            messages.append({"role": role, "content": content})
-    return messages
-
-
-def clear_messages(user_id):
-    return db_delete("chat_history", f"?user_id=eq.{encode_filter_value(user_id)}")
-
-
-def initialize_session(user_id):
-    if st.session_state.get("active_user_id") != user_id:
-        st.session_state.active_user_id = user_id
+def initialize_session(user_id, conversation_id):
+    active_key = f"{user_id}:{conversation_id}"
+    if st.session_state.get("active_session_key") != active_key:
+        st.session_state.active_session_key = active_key
         st.session_state.memories = load_memories(user_id)
-        st.session_state.messages = [{"role": "system", "content": build_system_prompt(memory_texts())}]
-        st.session_state.messages.extend(load_messages(user_id))
-        return
-    if "memories" not in st.session_state:
+        st.session_state.messages = [{"role": "system", "content": build_system_prompt()}]
+        st.session_state.messages.extend(load_messages(user_id, conversation_id))
+    elif "messages" not in st.session_state:
         st.session_state.memories = load_memories(user_id)
-    if "messages" not in st.session_state:
-        st.session_state.messages = [{"role": "system", "content": build_system_prompt(memory_texts())}]
-        st.session_state.messages.extend(load_messages(user_id))
+        st.session_state.messages = [{"role": "system", "content": build_system_prompt()}]
+        st.session_state.messages.extend(load_messages(user_id, conversation_id))
     else:
-        reset_system_message(st.session_state.get("search_enabled", False))
+        st.session_state.messages[0] = {"role": "system", "content": build_system_prompt(st.session_state.get("search_enabled", False))}
 
 
-def encode_uploaded_image(uploaded_file):
-    image_base64 = base64.b64encode(uploaded_file.getvalue()).decode("utf-8")
-    mime_type = uploaded_file.type or "image/jpeg"
-    return f"data:{mime_type};base64,{image_base64}"
-
-
-def get_search_context(query, enabled):
-    if not enabled:
-        return ""
-    # Placeholder for future Tavily, SerpAPI, or Bing Search integration.
-    return ""
-
-
-def load_today_usage(user_id):
-    encoded_user_id = encode_filter_value(user_id)
-    return load_usage_since(encoded_user_id, today_start_iso())
-
-
-def load_month_usage(user_id):
-    encoded_user_id = encode_filter_value(user_id)
-    return load_usage_since(encoded_user_id, month_start_iso())
-
-
-def load_usage_since(encoded_user_id, start_time):
+def load_usage_since(user_id, start_time):
     rows = db_get(
         "usage_logs",
-        f"?user_id=eq.{encoded_user_id}&created_at=gte.{quote(start_time, safe=':-.')}&select=total_tokens",
+        f"?user_id=eq.{encode_filter_value(user_id)}&created_at=gte.{quote(start_time, safe=':-.')}&select=total_tokens",
     )
     return len(rows), sum(int(row.get("total_tokens") or 0) for row in rows)
 
 
 def can_use_ai(user):
     _, daily_limit, token_limit, monthly_limit, monthly_token_limit, _ = effective_limits(user)
-    calls_today, tokens_today = load_today_usage(user["user_id"])
-    calls_month, tokens_month = load_month_usage(user["user_id"])
+    calls_today, tokens_today = load_usage_since(user["user_id"], today_start_iso())
+    calls_month, tokens_month = load_usage_since(user["user_id"], month_start_iso())
     if calls_today >= daily_limit:
         return False, f"今日使用次数已达上限：{daily_limit} 次"
     if tokens_today >= token_limit:
-        return False, f"今日 token 已达上限：{token_limit}"
+        return False, f"今日 Token 已达上限：{token_limit}"
     if calls_month >= monthly_limit:
         return False, f"本月使用次数已达上限：{monthly_limit} 次"
     if tokens_month >= monthly_token_limit:
-        return False, f"本月 token 已达上限：{monthly_token_limit}"
+        return False, f"本月 Token 已达上限：{monthly_token_limit}"
     return True, ""
 
 
@@ -561,32 +769,55 @@ def record_usage(user_id, model, usage):
     prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0
     completion_tokens = getattr(usage, "completion_tokens", 0) or 0
     total_tokens = getattr(usage, "total_tokens", prompt_tokens + completion_tokens) or 0
-    return bool(
-        db_insert(
-            "usage_logs",
-            {
-                "user_id": user_id,
-                "model": model,
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "total_tokens": total_tokens,
-            },
-        )
+    return db_insert(
+        "usage_logs",
+        {
+            "user_id": user_id,
+            "model": model,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+            "created_at": utc_now_iso(),
+        },
     )
 
 
+def encode_uploaded_image(uploaded_file):
+    image_base64 = base64.b64encode(uploaded_file.getvalue()).decode("utf-8")
+    mime_type = uploaded_file.type or "image/jpeg"
+    return f"data:{mime_type};base64,{image_base64}", image_base64
+
+
+def get_search_context(query, enabled):
+    if not enabled:
+        return ""
+    return ""
+
+
 def create_payment_order(user_id, plan):
-    plan_id = plan.get("plan_id") or DEFAULT_PLAN_ID
-    amount = float(plan.get("price") or 0)
-    payment = {
-        "user_id": user_id,
-        "plan_id": plan_id,
-        "amount": amount,
-        "status": "pending",
-        "created_at": utc_now_iso(),
-    }
-    rows = db_insert("payments", payment, return_rows=True)
+    rows = db_insert(
+        "payments",
+        {
+            "user_id": user_id,
+            "plan_id": plan.get("plan_id") or DEFAULT_PLAN_ID,
+            "amount": float(plan.get("price") or 0),
+            "status": "pending",
+            "created_at": utc_now_iso(),
+        },
+        return_rows=True,
+    )
     return rows[0] if rows else None
+
+
+def upload_payment_screenshot(user_id, payment_id, uploaded_file):
+    if not uploaded_file:
+        return False
+    encoded = base64.b64encode(uploaded_file.getvalue()).decode("utf-8")
+    return db_patch(
+        "payments",
+        f"?id=eq.{encode_filter_value(payment_id)}&user_id=eq.{encode_filter_value(user_id)}",
+        {"screenshot_base64": encoded},
+    )
 
 
 def render_qr_image(label, secret_name, upload_key):
@@ -594,187 +825,46 @@ def render_qr_image(label, secret_name, upload_key):
     uploaded_qr = st.file_uploader(f"上传{label}收款码", type=["png", "jpg", "jpeg"], key=upload_key)
     if uploaded_qr:
         st.image(uploaded_qr, caption=label, width=220)
-        return
-    if qr_url:
+    elif qr_url:
         st.image(qr_url, caption=label, width=220)
-        return
-    st.caption(f"可上传{label}收款码，或在 Streamlit Secrets 配置 `{secret_name}` 图片链接。")
-
-
-def render_payment_page(order, plan):
-    st.success(f"订单已创建：#{order.get('id')}，状态：待支付")
-    st.write(f"购买套餐：**{plan.get('name', plan.get('plan_id'))}**")
-    st.write(f"应付金额：**{format_money(order.get('amount'))}**")
-    st.info("请付款后联系管理员审核开通")
-    st.caption("这里保留支付宝官方 API / 微信支付 API 的接入位置，后续可替换为真实支付网关回调。")
-
-    qr_cols = st.columns(2)
-    with qr_cols[0]:
-        st.markdown("##### 支付宝收款码")
-        render_qr_image("支付宝", "ALIPAY_QR_IMAGE_URL", f"alipay_qr_{order.get('id')}")
-    with qr_cols[1]:
-        st.markdown("##### 微信收款码")
-        render_qr_image("微信", "WECHAT_QR_IMAGE_URL", f"wechat_qr_{order.get('id')}")
+    else:
+        st.caption(f"可上传{label}收款码，或在 Secrets 配置 `{secret_name}` 图片链接。")
 
 
 def render_upgrade_panel(user):
-    st.subheader("开通会员 / 升级套餐")
-    gateway_url = get_secret("PAYMENT_GATEWAY_URL", "https://example.com/pay")
-    st.caption("当前为简易人工审核支付。后续可接入支付宝官方 API、微信支付 API 或真实支付网关。支付密钥请放在 Streamlit Secrets。")
-
+    st.subheader("会员中心")
+    st.caption("当前为二维码收款 + 管理员人工审核。支付宝 / 微信官方 API 接入位置已保留。")
     latest_order = st.session_state.get("latest_payment_order")
     latest_plan = st.session_state.get("latest_payment_plan")
     if latest_order and latest_plan:
-        render_payment_page(latest_order, latest_plan)
+        st.success(f"订单 #{latest_order.get('id')} 已创建，状态：pending")
+        st.write(f"套餐：**{latest_plan.get('name')}**  金额：**¥{float(latest_order.get('amount') or 0):.2f}**")
+        st.info("请付款后联系管理员审核开通")
+        cols = st.columns(2)
+        with cols[0]:
+            st.markdown("##### 支付宝收款码")
+            render_qr_image("支付宝", "ALIPAY_QR_IMAGE_URL", f"alipay_{latest_order.get('id')}")
+        with cols[1]:
+            st.markdown("##### 微信收款码")
+            render_qr_image("微信", "WECHAT_QR_IMAGE_URL", f"wechat_{latest_order.get('id')}")
+        screenshot = st.file_uploader("上传付款截图", type=["png", "jpg", "jpeg"], key=f"payshot_{latest_order.get('id')}")
+        if st.button("提交付款截图", use_container_width=True):
+            if upload_payment_screenshot(user["user_id"], latest_order.get("id"), screenshot):
+                st.success("付款截图已提交，请等待管理员审核。")
         st.divider()
-
     for plan in list_plans():
         with st.container(border=True):
-            st.write(f"**{plan.get('name', plan.get('plan_id'))}**")
-            st.write(f"每日次数：{plan.get('daily_limit')} ｜ 每日 tokens：{plan.get('token_limit')}")
-            st.write(f"每月次数：{plan.get('monthly_limit')} ｜ 每月 tokens：{plan.get('monthly_token_limit')}")
-            st.write(f"价格：{plan.get('price', 0)} / {plan.get('billing_cycle', 'free')}")
+            st.write(f"### {plan.get('name')}")
+            st.write(plan.get("description") or "")
+            st.write(f"价格：¥{float(plan.get('price') or 0):.2f}")
+            st.write(f"每日 {plan.get('daily_limit')} 次 / {plan.get('token_limit')} Tokens")
+            st.write(f"每月 {plan.get('monthly_limit')} 次 / {plan.get('monthly_token_limit')} Tokens")
             if st.button("购买套餐", key=f"buy_{plan.get('plan_id')}", use_container_width=True):
                 order = create_payment_order(user["user_id"], plan)
                 if order:
                     st.session_state.latest_payment_order = order
                     st.session_state.latest_payment_plan = plan
-                    st.info(f"已创建待支付订单。未来可接入支付网关：{gateway_url}?plan_id={plan.get('plan_id')}")
                     st.rerun()
-
-
-def render_memory_manager(user_id):
-    st.sidebar.subheader("记忆管理")
-    memories = st.session_state.get("memories", [])
-    if not memories:
-        st.sidebar.caption("暂无长期记忆")
-    else:
-        for memory in memories:
-            cols = st.sidebar.columns([0.78, 0.22])
-            cols[0].write(memory["memory"])
-            if cols[1].button("删除", key=f"delete_memory_{memory['id']}"):
-                if delete_memory(user_id, memory["id"]):
-                    refresh_memories(user_id)
-                    st.rerun()
-    if st.sidebar.button("清空全部长期记忆", use_container_width=True):
-        if clear_memories(user_id):
-            refresh_memories(user_id)
-            st.rerun()
-
-
-def render_sidebar(user):
-    plan, daily_limit, token_limit, monthly_limit, monthly_token_limit, is_expired = effective_limits(user)
-    calls_today, tokens_today = load_today_usage(user["user_id"])
-    calls_month, tokens_month = load_month_usage(user["user_id"])
-    remaining_tokens_today = max(token_limit - tokens_today, 0)
-    st.sidebar.title("毛毛AI")
-    st.sidebar.caption(f"当前用户：{user.get('username') or user.get('email')}")
-    st.sidebar.caption(f"套餐：{plan.get('name', user.get('plan'))}")
-    if is_expired:
-        st.sidebar.warning("套餐已过期，已按免费版限制使用")
-    metric_cols = st.sidebar.columns(2)
-    metric_cols[0].metric("今日次数", f"{calls_today}/{daily_limit}")
-    metric_cols[1].metric("剩余 Tokens", remaining_tokens_today)
-    st.sidebar.caption(f"本月次数：{calls_month}/{monthly_limit} ｜ 本月 Tokens：{tokens_month}/{monthly_token_limit}")
-    model_name = st.sidebar.selectbox("模型", MODEL_OPTIONS, index=0)
-    search_enabled = st.sidebar.toggle("启用联网搜索", value=st.session_state.get("search_enabled", False))
-    st.session_state.search_enabled = search_enabled
-    reset_system_message(search_enabled)
-    st.sidebar.divider()
-    render_memory_manager(user["user_id"])
-    st.sidebar.divider()
-    if st.sidebar.button("清空聊天记录", use_container_width=True):
-        if clear_messages(user["user_id"]):
-            st.session_state.messages = [{"role": "system", "content": build_system_prompt(memory_texts(), search_enabled)}]
-            st.rerun()
-    if st.sidebar.button("退出登录", use_container_width=True):
-        for key in ["login", "user", "user_id", "active_user_id", "messages", "memories"]:
-            st.session_state.pop(key, None)
-        st.rerun()
-    return model_name, search_enabled
-
-
-def list_users_for_admin():
-    return db_get(
-        "users",
-        "?select=*&order=created_at.desc",
-    )
-
-
-def list_payments_for_admin():
-    return db_get("payments", "?select=*&order=created_at.desc")
-
-
-def plan_name_map(plans):
-    return {plan.get("plan_id"): plan.get("name", plan.get("plan_id")) for plan in plans}
-
-
-def format_money(value):
-    try:
-        return f"¥{float(value or 0):,.2f}"
-    except (TypeError, ValueError):
-        return "¥0.00"
-
-
-def load_today_user_count():
-    rows = db_get("users", f"?created_at=gte.{quote(today_start_iso(), safe=':-.')}&select=id")
-    return len(rows)
-
-
-def load_today_chat_count():
-    rows = db_get(
-        "chat_history",
-        f"?role=eq.user&created_at=gte.{quote(today_start_iso(), safe=':-.')}&select=id",
-    )
-    return len(rows)
-
-
-def load_today_token_total():
-    rows = db_get(
-        "usage_logs",
-        f"?created_at=gte.{quote(today_start_iso(), safe=':-.')}&select=total_tokens",
-    )
-    return sum(int(row.get("total_tokens") or 0) for row in rows)
-
-
-def load_total_revenue():
-    rows = db_get("payments", "?status=eq.paid&select=amount")
-    total = 0.0
-    for row in rows:
-        try:
-            total += float(row.get("amount") or 0)
-        except (TypeError, ValueError):
-            pass
-    return total
-
-
-def delete_user_and_data(user_id):
-    encoded_user_id = encode_filter_value(user_id)
-    clear_messages(user_id)
-    clear_memories(user_id)
-    db_delete("usage_logs", f"?user_id=eq.{encoded_user_id}")
-    return db_delete("users", f"?user_id=eq.{encoded_user_id}")
-
-
-def update_plan_config(plan_id, data):
-    return db_patch("plans", f"?plan_id=eq.{encode_filter_value(plan_id)}", data)
-
-
-def update_payment_status(payment_id, status):
-    return db_patch("payments", f"?id=eq.{encode_filter_value(payment_id)}", {"status": status})
-
-
-def plan_expire_at(plan):
-    billing_cycle = plan.get("billing_cycle") or "free"
-    days_by_cycle = {
-        "monthly": 30,
-        "quarterly": 90,
-        "yearly": 365,
-    }
-    days = days_by_cycle.get(billing_cycle)
-    if not days:
-        return None
-    return (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
 
 
 def open_membership(user_id, plan_id):
@@ -783,12 +873,12 @@ def open_membership(user_id, plan_id):
         "users",
         f"?user_id=eq.{encode_filter_value(user_id)}",
         {
-            "plan_id": plan.get("plan_id") or DEFAULT_PLAN_ID,
-            "plan": plan.get("plan_id") or DEFAULT_PLAN_ID,
-            "daily_limit": int(plan.get("daily_limit") or DEFAULT_DAILY_LIMIT),
-            "token_limit": int(plan.get("token_limit") or DEFAULT_TOKEN_LIMIT),
-            "monthly_limit": int(plan.get("monthly_limit") or DEFAULT_MONTHLY_LIMIT),
-            "monthly_token_limit": int(plan.get("monthly_token_limit") or DEFAULT_MONTHLY_TOKEN_LIMIT),
+            "plan_id": plan.get("plan_id") or FREE_PLAN_ID,
+            "plan": plan.get("plan_id") or FREE_PLAN_ID,
+            "daily_limit": int(plan.get("daily_limit") or 20),
+            "token_limit": int(plan.get("token_limit") or 50000),
+            "monthly_limit": int(plan.get("monthly_limit") or 300),
+            "monthly_token_limit": int(plan.get("monthly_token_limit") or 1000000),
             "expire_at": plan_expire_at(plan),
         },
     )
@@ -802,315 +892,426 @@ def close_membership(user_id):
         {
             "plan_id": FREE_PLAN_ID,
             "plan": FREE_PLAN_ID,
-            "daily_limit": int(free_plan.get("daily_limit") or DEFAULT_DAILY_LIMIT),
-            "token_limit": int(free_plan.get("token_limit") or DEFAULT_TOKEN_LIMIT),
-            "monthly_limit": int(free_plan.get("monthly_limit") or DEFAULT_MONTHLY_LIMIT),
-            "monthly_token_limit": int(free_plan.get("monthly_token_limit") or DEFAULT_MONTHLY_TOKEN_LIMIT),
+            "daily_limit": int(free_plan.get("daily_limit") or 20),
+            "token_limit": int(free_plan.get("token_limit") or 50000),
+            "monthly_limit": int(free_plan.get("monthly_limit") or 300),
+            "monthly_token_limit": int(free_plan.get("monthly_token_limit") or 1000000),
             "expire_at": None,
         },
     )
 
 
-def approve_payment_order(payment):
+def create_commission_for_payment(payment):
     user_id = payment.get("user_id")
-    plan_id = payment.get("plan_id") or DEFAULT_PLAN_ID
-    payment_id = payment.get("id")
-    if not user_id or not payment_id:
-        st.error("订单缺少 user_id 或 id，无法开通")
+    referral = first_row("referrals", f"?referred_user_id=eq.{encode_filter_value(user_id)}&select=*&limit=1")
+    if not referral:
         return False
-    membership_ok = open_membership(user_id, plan_id)
-    status_ok = update_payment_status(payment_id, "paid")
-    return membership_ok and status_ok
+    amount = float(payment.get("amount") or 0)
+    if amount <= 0:
+        return False
+    return db_insert(
+        "commissions",
+        {
+            "payment_id": payment.get("id"),
+            "referrer_user_id": referral.get("referrer_user_id"),
+            "referred_user_id": user_id,
+            "amount": round(amount * COMMISSION_RATE, 2),
+            "status": "pending",
+            "created_at": utc_now_iso(),
+        },
+    )
 
 
-def render_admin_user_management(users, plans):
-    st.markdown("#### 用户管理")
-    search = st.text_input("搜索用户", placeholder="输入用户名、邮箱或 user_id")
-    keyword = search.strip().lower()
+def approve_payment_order(payment):
+    ok = open_membership(payment.get("user_id"), payment.get("plan_id") or FREE_PLAN_ID)
+    if ok:
+        db_patch("payments", f"?id=eq.{encode_filter_value(payment.get('id'))}", {"status": "paid"})
+        create_commission_for_payment(payment)
+    return ok
+
+
+def cancel_payment_order(payment):
+    db_patch("commissions", f"?payment_id=eq.{encode_filter_value(payment.get('id'))}", {"status": "cancelled"})
+    return db_patch("payments", f"?id=eq.{encode_filter_value(payment.get('id'))}", {"status": "cancelled"})
+
+
+def render_conversation_sidebar(user):
+    st.sidebar.title("毛毛AI")
+    if st.sidebar.button("+ 新建对话", use_container_width=True):
+        created = create_conversation(user["user_id"])
+        if created:
+            st.session_state.active_conversation_id = created["id"]
+            st.session_state.active_session_key = None
+            st.rerun()
+    conversations = list_conversations(user["user_id"])
+    st.sidebar.caption("历史会话")
+    for conv in conversations:
+        is_active = str(conv.get("id")) == str(st.session_state.get("active_conversation_id"))
+        label = ("● " if is_active else "") + (conv.get("title") or "未命名对话")
+        if st.sidebar.button(label, key=f"conv_pick_{conv.get('id')}", use_container_width=True):
+            st.session_state.active_conversation_id = conv.get("id")
+            st.session_state.active_session_key = None
+            st.rerun()
+        with st.sidebar.expander("管理：" + (conv.get("title") or "未命名")):
+            new_title = st.text_input("重命名", value=conv.get("title") or "", key=f"rename_{conv.get('id')}")
+            cols = st.columns(2)
+            if cols[0].button("保存", key=f"save_rename_{conv.get('id')}"):
+                rename_conversation(user["user_id"], conv.get("id"), new_title)
+                st.rerun()
+            if cols[1].button("删除", key=f"delete_conv_{conv.get('id')}"):
+                delete_conversation(user["user_id"], conv.get("id"))
+                st.session_state.active_conversation_id = None
+                st.rerun()
+    st.sidebar.divider()
+    if st.sidebar.button("清空全部会话", use_container_width=True):
+        clear_all_conversations(user["user_id"])
+        st.session_state.active_conversation_id = None
+        st.rerun()
+
+
+def render_memory_sidebar(user):
+    st.sidebar.subheader("长期记忆")
+    memories = st.session_state.get("memories", [])
+    if not memories:
+        st.sidebar.caption("暂无长期记忆")
+    for memory in memories:
+        cols = st.sidebar.columns([0.75, 0.25])
+        cols[0].caption(memory["memory"])
+        if cols[1].button("删", key=f"mem_del_{memory['id']}"):
+            delete_memory(user["user_id"], memory["id"])
+            st.session_state.memories = load_memories(user["user_id"])
+            st.rerun()
+    if st.sidebar.button("清空长期记忆", use_container_width=True):
+        clear_memories(user["user_id"])
+        st.session_state.memories = []
+        st.rerun()
+
+
+def render_user_sidebar(user):
+    plan, daily_limit, token_limit, monthly_limit, monthly_token_limit, is_expired = effective_limits(user)
+    calls_today, tokens_today = load_usage_since(user["user_id"], today_start_iso())
+    st.sidebar.divider()
+    st.sidebar.caption(f"用户：{user.get('username') or user.get('email')}")
+    st.sidebar.caption(f"推广码：`{user.get('referral_code') or '未生成'}`")
+    st.sidebar.caption(f"套餐：{plan.get('name')}")
+    if is_expired:
+        st.sidebar.warning("套餐已过期，已按免费版限制")
+    st.sidebar.metric("今日次数", f"{calls_today}/{daily_limit}")
+    st.sidebar.metric("今日剩余 Tokens", max(token_limit - tokens_today, 0))
+    render_memory_sidebar(user)
+    st.sidebar.divider()
+    if st.sidebar.button("退出登录", use_container_width=True):
+        for key in ["login", "user", "user_id", "active_conversation_id", "active_session_key", "messages", "memories"]:
+            st.session_state.pop(key, None)
+        st.rerun()
+
+
+def build_openai_messages(question, uploaded_file=None, include_last_image=False):
+    messages = list(st.session_state.messages)
+    if uploaded_file:
+        image_url, image_base64 = encode_uploaded_image(uploaded_file)
+        st.session_state.last_image_url = image_url
+        st.session_state.last_image_base64 = image_base64
+    else:
+        image_url = st.session_state.get("last_image_url") if include_last_image else None
+    if image_url:
+        messages.append(
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": question},
+                    {"type": "image_url", "image_url": {"url": image_url}},
+                ],
+            }
+        )
+    else:
+        messages.append({"role": "user", "content": question})
+    return messages
+
+
+def chat_completion_stream(model_name, messages):
+    placeholder = st.empty()
+    collected = ""
+    response_obj = None
+    try:
+        stream = client.chat.completions.create(model=model_name, messages=messages, stream=True)
+        for chunk in stream:
+            delta = chunk.choices[0].delta.content or ""
+            collected += delta
+            placeholder.markdown(collected)
+        response_obj = None
+    except Exception:
+        response = client.chat.completions.create(model=model_name, messages=messages)
+        collected = response.choices[0].message.content or ""
+        placeholder.markdown(collected)
+        response_obj = response
+    return collected, response_obj
+
+
+def render_chat(user, conversation_id):
+    current_conversation = first_row(
+        "conversations",
+        f"?id=eq.{encode_filter_value(conversation_id)}&user_id=eq.{encode_filter_value(user['user_id'])}&select=*&limit=1",
+    )
+    top_cols = st.columns([0.58, 0.22, 0.2])
+    with top_cols[0]:
+        st.markdown(f"### {current_conversation.get('title') if current_conversation else '新对话'}")
+    with top_cols[1]:
+        model_name = st.selectbox("模型", MODEL_OPTIONS, index=0, label_visibility="collapsed")
+    with top_cols[2]:
+        search_enabled = st.toggle("联网搜索", value=st.session_state.get("search_enabled", False))
+    st.session_state.search_enabled = search_enabled
+    st.session_state.messages[0] = {"role": "system", "content": build_system_prompt(search_enabled, get_search_context("", search_enabled))}
+
+    visible_messages = [m for m in st.session_state.messages if m.get("role") != "system"]
+    if not visible_messages:
+        st.markdown('<div class="maomao-hero"><h1>今天想让毛毛AI帮你做什么？</h1><p class="maomao-small">可以聊天、分析图片、写代码、整理资料，也可以输入“记住xxx”保存长期记忆。</p></div>', unsafe_allow_html=True)
+        card_cols = st.columns(3)
+        quicks = ["帮我总结一段文字", "帮我写一份推广文案", "帮我分析这张图片"]
+        for idx, prompt in enumerate(quicks):
+            if card_cols[idx].button(prompt, use_container_width=True):
+                st.session_state.quick_prompt = prompt
+                st.rerun()
+
+    for idx, msg in enumerate(visible_messages):
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+            if msg["role"] == "assistant":
+                with st.expander("复制回答"):
+                    st.code(msg["content"], language="markdown")
+
+    can_use, limit_message = can_use_ai(user)
+    if not can_use:
+        st.warning(limit_message)
+
+    uploaded_file = st.file_uploader("上传图片后可继续追问", type=["png", "jpg", "jpeg"], label_visibility="collapsed")
+    if uploaded_file:
+        st.image(uploaded_file, width=260)
+    include_last_image = bool(st.session_state.get("last_image_url")) and st.checkbox("本轮带上最近一次上传的图片", value=False)
+    prompt = st.chat_input("给毛毛AI发送消息", disabled=not can_use)
+    if st.session_state.get("quick_prompt"):
+        prompt = st.session_state.pop("quick_prompt")
+    if not prompt and uploaded_file and can_use:
+        prompt = "请分析这张图片"
+    if prompt and can_use:
+        command, command_value = extract_memory_command(prompt)
+        save_message(user["user_id"], conversation_id, "user", prompt)
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        if current_conversation and (current_conversation.get("title") or "") == "新对话":
+            rename_conversation(user["user_id"], conversation_id, prompt[:28])
+        with st.chat_message("user"):
+            st.markdown(prompt)
+        if command == "remember":
+            save_memory(user["user_id"], command_value)
+            st.session_state.memories = load_memories(user["user_id"])
+            answer = f"已记住：{command_value}"
+        elif command == "forget":
+            count = forget_memories(user["user_id"], command_value)
+            answer = f"已忘记与“{command_value}”相关的 {count} 条记忆。"
+        else:
+            openai_messages = build_openai_messages(prompt, uploaded_file, include_last_image)
+            with st.chat_message("assistant"):
+                answer, response_obj = chat_completion_stream(model_name, openai_messages)
+            if response_obj and getattr(response_obj, "usage", None):
+                record_usage(user["user_id"], model_name, response_obj.usage)
+        if command in {"remember", "forget"}:
+            with st.chat_message("assistant"):
+                st.markdown(answer)
+        st.session_state.messages.append({"role": "assistant", "content": answer})
+        save_message(user["user_id"], conversation_id, "assistant", answer)
+        if st.button("重新生成上一条回答", key="regen_last"):
+            st.session_state.quick_prompt = prompt
+            st.rerun()
+
+
+def list_users_for_admin():
+    return db_get("users", "?select=*&order=created_at.desc")
+
+
+def list_payments_for_admin():
+    return db_get("payments", "?select=*&order=created_at.desc")
+
+
+def list_invites_for_admin():
+    return db_get("invite_codes", "?select=*&order=created_at.desc")
+
+
+def list_commissions_for_admin():
+    return db_get("commissions", "?select=*&order=created_at.desc")
+
+
+def admin_stats():
+    today_users = len(db_get("users", f"?created_at=gte.{quote(today_start_iso(), safe=':-.')}&select=id"))
+    today_chats = len(db_get("chat_history", f"?role=eq.user&created_at=gte.{quote(today_start_iso(), safe=':-.')}&select=id"))
+    usage = db_get("usage_logs", f"?created_at=gte.{quote(today_start_iso(), safe=':-.')}&select=total_tokens")
+    tokens = sum(int(row.get("total_tokens") or 0) for row in usage)
+    revenue_rows = db_get("payments", "?status=eq.paid&select=amount")
+    revenue = sum(float(row.get("amount") or 0) for row in revenue_rows)
+    conv_count = len(db_get("conversations", "?select=id"))
+    return today_users, today_chats, tokens, revenue, conv_count
+
+
+def render_admin_users(users):
+    keyword = st.text_input("搜索用户", placeholder="用户名 / 邮箱 / user_id")
     if keyword:
-        users = [
-            user
-            for user in users
-            if keyword in str(user.get("username", "")).lower()
-            or keyword in str(user.get("email", "")).lower()
-            or keyword in str(user.get("user_id", "")).lower()
-        ]
-    st.caption(f"共 {len(users)} 个用户")
-
-    plan_ids = [plan.get("plan_id") for plan in plans if plan.get("plan_id")]
-    if not plan_ids:
-        plan_ids = ADMIN_PLAN_IDS
-    name_map = plan_name_map(plans)
-
+        k = keyword.lower()
+        users = [u for u in users if k in str(u.get("username", "")).lower() or k in str(u.get("email", "")).lower() or k in str(u.get("user_id", "")).lower()]
+    plans = list_plans()
+    plan_ids = [p["plan_id"] for p in plans]
+    plan_names = {p["plan_id"]: p.get("name") for p in plans}
     for user in users:
         user_id = user.get("user_id")
-        title = f"{user.get('username') or '未命名'} / {user.get('email') or '无邮箱'}"
-        with st.expander(title):
-            calls_today, tokens_today = load_today_usage(user_id)
-            calls_month, tokens_month = load_month_usage(user_id)
+        with st.expander(f"{user.get('username')} / {user.get('email')}"):
             st.write(f"user_id：`{user_id}`")
-            st.write(f"今日使用：{calls_today} 次，{tokens_today} tokens")
-            st.write(f"本月使用：{calls_month} 次，{tokens_month} tokens")
-
-            current_plan_id = user_plan_id(user)
-            plan_index = plan_ids.index(current_plan_id) if current_plan_id in plan_ids else 0
-            plan_id = st.selectbox(
-                "套餐",
-                plan_ids,
-                index=plan_index,
-                format_func=lambda value: f"{name_map.get(value, value)} ({value})",
-                key=f"admin_plan_{user_id}",
-            )
-            col_a, col_b = st.columns(2)
-            daily_limit = col_a.number_input(
-                "每日次数",
-                value=int(user.get("daily_limit") or DEFAULT_DAILY_LIMIT),
-                min_value=0,
-                step=1,
-                key=f"admin_daily_{user_id}",
-            )
-            token_limit = col_b.number_input(
-                "每日 Token 额度",
-                value=int(user.get("token_limit") or DEFAULT_TOKEN_LIMIT),
-                min_value=0,
-                step=1000,
-                key=f"admin_token_{user_id}",
-            )
-            monthly_limit = col_a.number_input(
-                "每月次数",
-                value=int(user.get("monthly_limit") or DEFAULT_MONTHLY_LIMIT),
-                min_value=0,
-                step=10,
-                key=f"admin_monthly_{user_id}",
-            )
-            monthly_token_limit = col_b.number_input(
-                "每月 Token 额度",
-                value=int(user.get("monthly_token_limit") or DEFAULT_MONTHLY_TOKEN_LIMIT),
-                min_value=0,
-                step=10000,
-                key=f"admin_monthly_token_{user_id}",
-            )
-            expire_at = st.text_input(
-                "到期时间 ISO，可留空",
-                value=user.get("expire_at") or "",
-                key=f"admin_expire_{user_id}",
-            )
-            disabled = st.checkbox("封禁用户", value=bool(user.get("disabled")), key=f"admin_disabled_{user_id}")
-            is_admin = st.checkbox("管理员", value=bool(user.get("is_admin")), key=f"admin_is_admin_{user_id}")
-
-            save_col, close_col, clear_col, delete_col = st.columns(4)
-            if save_col.button("保存用户", key=f"admin_save_user_{user_id}"):
+            st.write(f"推广码：`{user.get('referral_code')}` 上级：`{user.get('invited_by')}`")
+            current_plan = user_plan_id(user)
+            idx = plan_ids.index(current_plan) if current_plan in plan_ids else 0
+            plan_id = st.selectbox("套餐", plan_ids, index=idx, format_func=lambda p: f"{plan_names.get(p, p)} ({p})", key=f"admin_plan_{user_id}")
+            c1, c2 = st.columns(2)
+            daily_limit = c1.number_input("每日次数", value=int(user.get("daily_limit") or 20), min_value=0, key=f"daily_{user_id}")
+            token_limit = c2.number_input("每日 Token", value=int(user.get("token_limit") or 50000), min_value=0, key=f"token_{user_id}")
+            monthly_limit = c1.number_input("每月次数", value=int(user.get("monthly_limit") or 300), min_value=0, key=f"month_{user_id}")
+            monthly_token_limit = c2.number_input("每月 Token", value=int(user.get("monthly_token_limit") or 1000000), min_value=0, key=f"month_token_{user_id}")
+            disabled = st.checkbox("封禁用户", value=bool(user.get("disabled")), key=f"disabled_{user_id}")
+            is_admin = st.checkbox("管理员", value=bool(user.get("is_admin")), key=f"is_admin_{user_id}")
+            cols = st.columns(5)
+            if cols[0].button("保存", key=f"save_user_{user_id}"):
                 db_patch(
                     "users",
                     f"?user_id=eq.{encode_filter_value(user_id)}",
                     {
-                        "disabled": disabled,
-                        "is_admin": is_admin,
                         "plan_id": plan_id,
                         "plan": plan_id,
                         "daily_limit": int(daily_limit),
                         "token_limit": int(token_limit),
                         "monthly_limit": int(monthly_limit),
                         "monthly_token_limit": int(monthly_token_limit),
-                        "expire_at": expire_at or None,
+                        "disabled": disabled,
+                        "is_admin": is_admin,
                     },
                 )
                 st.rerun()
-            if close_col.button("关闭会员", key=f"admin_close_membership_{user_id}"):
-                if close_membership(user_id):
-                    st.rerun()
-            if clear_col.button("清空聊天", key=f"admin_clear_chat_{user_id}"):
-                clear_messages(user_id)
+            if cols[1].button("一键开通", key=f"open_{user_id}"):
+                open_membership(user_id, plan_id)
+                st.rerun()
+            if cols[2].button("关闭会员", key=f"close_{user_id}"):
+                close_membership(user_id)
+                st.rerun()
+            if cols[3].button("清空聊天", key=f"clear_chat_{user_id}"):
+                db_delete("chat_history", f"?user_id=eq.{encode_filter_value(user_id)}")
+                db_delete("conversations", f"?user_id=eq.{encode_filter_value(user_id)}")
+                st.rerun()
+            if cols[4].button("清空记忆", key=f"clear_mem_{user_id}"):
+                clear_memories(user_id)
                 st.rerun()
 
-            confirm_delete = st.checkbox("确认删除该用户", key=f"admin_confirm_delete_{user_id}")
-            is_current_admin = user_id == st.session_state.get("user_id")
-            if delete_col.button(
-                "删除用户",
-                key=f"admin_delete_user_{user_id}",
-                disabled=(not confirm_delete or is_current_admin),
-            ):
-                if delete_user_and_data(user_id):
-                    st.rerun()
-            if is_current_admin:
-                st.caption("当前登录管理员不能在这里删除自己。")
 
-
-def render_admin_plan_management(plans):
-    st.markdown("#### 套餐管理")
-    st.caption("后台可直接修改免费版、月卡、季卡、年卡的价格和额度。")
-    plan_map = {plan.get("plan_id"): plan for plan in plans}
-
-    for fallback in FALLBACK_PLANS:
-        plan_id = fallback["plan_id"]
-        plan = {**fallback, **plan_map.get(plan_id, {})}
-        with st.expander(f"{plan.get('name')} ({plan_id})", expanded=plan_id == FREE_PLAN_ID):
-            name = st.text_input("套餐名称", value=plan.get("name") or "", key=f"plan_name_{plan_id}")
-            billing_options = ["free", "monthly", "quarterly", "yearly"]
-            billing_value = plan.get("billing_cycle") or fallback["billing_cycle"]
-            billing_cycle = st.selectbox(
-                "计费周期",
-                billing_options,
-                index=billing_options.index(billing_value) if billing_value in billing_options else 0,
-                key=f"plan_cycle_{plan_id}",
-            )
-            price = st.number_input(
-                "价格",
-                value=float(plan.get("price") or 0),
-                min_value=0.0,
-                step=1.0,
-                key=f"plan_price_{plan_id}",
-            )
-            col_a, col_b = st.columns(2)
-            daily_limit = col_a.number_input(
-                "每日次数",
-                value=int(plan.get("daily_limit") or fallback["daily_limit"]),
-                min_value=0,
-                step=1,
-                key=f"plan_daily_{plan_id}",
-            )
-            token_limit = col_b.number_input(
-                "每日 Token 额度",
-                value=int(plan.get("token_limit") or fallback["token_limit"]),
-                min_value=0,
-                step=1000,
-                key=f"plan_token_{plan_id}",
-            )
-            monthly_limit = col_a.number_input(
-                "每月次数",
-                value=int(plan.get("monthly_limit") or fallback["monthly_limit"]),
-                min_value=0,
-                step=10,
-                key=f"plan_monthly_{plan_id}",
-            )
-            monthly_token_limit = col_b.number_input(
-                "每月 Token 额度",
-                value=int(plan.get("monthly_token_limit") or fallback["monthly_token_limit"]),
-                min_value=0,
-                step=10000,
-                key=f"plan_monthly_token_{plan_id}",
-            )
-            description = st.text_area("套餐说明", value=plan.get("description") or "", key=f"plan_desc_{plan_id}")
-            if st.button("保存套餐", key=f"save_plan_{plan_id}"):
-                ok = update_plan_config(
-                    plan_id,
-                    {
-                        "name": name,
-                        "price": float(price),
-                        "billing_cycle": billing_cycle,
-                        "daily_limit": int(daily_limit),
-                        "token_limit": int(token_limit),
-                        "monthly_limit": int(monthly_limit),
-                        "monthly_token_limit": int(monthly_token_limit),
-                        "description": description,
-                    },
-                )
-                if ok:
-                    st.rerun()
-
-
-def render_admin_order_management(payments, plans):
-    st.markdown("#### 订单管理")
-    search = st.text_input("搜索订单", placeholder="输入 user_id、plan_id、支付方式或状态")
-    keyword = search.strip().lower()
-    if keyword:
-        payments = [
-            payment
-            for payment in payments
-            if keyword in str(payment.get("user_id", "")).lower()
-            or keyword in str(payment.get("plan_id", "")).lower()
-            or keyword in str(payment.get("status", "")).lower()
-        ]
-    st.caption(f"共 {len(payments)} 条订单")
-    name_map = plan_name_map(plans)
-    status_options = ["pending", "paid", "failed", "cancelled", "refunded"]
-
-    if not payments:
-        st.info("暂无支付订单")
-        return
-
-    def render_order_rows(order_rows, prefix):
-        if not order_rows:
-            st.info("暂无订单")
-            return
-        for payment in order_rows:
-            payment_id = payment.get("id")
-            plan_id = payment.get("plan_id")
-            status_text = payment.get("status") or "pending"
-            title = f"订单 #{payment_id} · {status_text} · {payment.get('user_id')} · {format_money(payment.get('amount'))}"
-            with st.expander(title):
-                st.write(f"用户：`{payment.get('user_id')}`")
-                st.write(f"套餐：{name_map.get(plan_id, plan_id)} ({plan_id})")
-                st.write(f"金额：{format_money(payment.get('amount'))}")
-                st.write(f"状态：{status_text}")
-                st.write(f"创建时间：{payment.get('created_at')}")
-                status = st.selectbox(
-                    "支付状态",
-                    status_options,
-                    index=status_options.index(status_text) if status_text in status_options else 0,
-                    key=f"{prefix}_payment_status_{payment_id}",
-                )
-                col_a, col_b, col_c = st.columns(3)
-                if col_a.button("更新状态", key=f"{prefix}_payment_save_{payment_id}"):
-                    if update_payment_status(payment_id, status):
+def render_admin_payments(payments):
+    pending = [p for p in payments if (p.get("status") or "pending") == "pending"]
+    paid = [p for p in payments if p.get("status") == "paid"]
+    tabs = st.tabs(["待审核订单", "已支付订单", "全部订单"])
+    for tab, rows in zip(tabs, [pending, paid, payments]):
+        with tab:
+            for payment in rows:
+                with st.expander(f"#{payment.get('id')} {payment.get('user_id')} ¥{payment.get('amount')} {payment.get('status')}"):
+                    st.json({k: v for k, v in payment.items() if k != "screenshot_base64"})
+                    if payment.get("screenshot_base64"):
+                        st.image(f"data:image/png;base64,{payment.get('screenshot_base64')}", width=260)
+                    cols = st.columns(3)
+                    if cols[0].button("审核通过并开通", key=f"approve_{payment.get('id')}"):
+                        approve_payment_order(payment)
                         st.rerun()
-                if col_b.button("审核开通会员", key=f"{prefix}_payment_open_{payment_id}"):
-                    if approve_payment_order(payment):
+                    if cols[1].button("取消订单", key=f"cancel_{payment.get('id')}"):
+                        cancel_payment_order(payment)
                         st.rerun()
-                if col_c.button("关闭该用户会员", key=f"{prefix}_payment_close_{payment_id}"):
-                    if close_membership(payment.get("user_id")):
+                    if cols[2].button("关闭该用户会员", key=f"close_pay_user_{payment.get('id')}"):
+                        close_membership(payment.get("user_id"))
                         st.rerun()
 
-    pending_orders = [payment for payment in payments if (payment.get("status") or "pending") == "pending"]
-    paid_orders = [payment for payment in payments if payment.get("status") == "paid"]
 
-    pending_tab, paid_tab, all_tab = st.tabs(["待支付订单", "已支付订单", "全部订单"])
-    with pending_tab:
-        render_order_rows(pending_orders, "pending")
-    with paid_tab:
-        render_order_rows(paid_orders, "paid")
-    with all_tab:
-        render_order_rows(payments, "all")
+def render_admin_invites(invites):
+    st.subheader("邀请码管理")
+    cols = st.columns(4)
+    code = cols[0].text_input("邀请码", value=f"INV{secrets.token_hex(3).upper()}")
+    max_uses = cols[1].number_input("可用次数", value=10, min_value=1)
+    promoter = cols[2].text_input("绑定推广人 user_id（可选）")
+    if cols[3].button("生成邀请码"):
+        db_insert(
+            "invite_codes",
+            {
+                "code": code.strip(),
+                "max_uses": int(max_uses),
+                "used_count": 0,
+                "promoter_user_id": promoter.strip() or None,
+                "disabled": False,
+                "created_at": utc_now_iso(),
+            },
+        )
+        st.rerun()
+    for invite in invites:
+        with st.expander(f"{invite.get('code')} / {invite.get('used_count')}/{invite.get('max_uses')}"):
+            disabled = st.checkbox("禁用", value=bool(invite.get("disabled")), key=f"invite_dis_{invite.get('id')}")
+            if st.button("保存邀请码", key=f"save_invite_{invite.get('id')}"):
+                db_patch("invite_codes", f"?id=eq.{encode_filter_value(invite.get('id'))}", {"disabled": disabled})
+                st.rerun()
 
 
-def render_admin_stats():
-    st.markdown("#### 数据统计")
-    col_a, col_b, col_c, col_d = st.columns(4)
-    col_a.metric("今日新增用户", load_today_user_count())
-    col_b.metric("今日聊天次数", load_today_chat_count())
-    col_c.metric("今日 Token 消耗", load_today_token_total())
-    col_d.metric("总收入", format_money(load_total_revenue()))
+def render_admin_referrals(commissions):
+    st.subheader("推广返佣")
+    referrals = db_get("referrals", "?select=*&order=created_at.desc")
+    st.write("推广关系")
+    st.dataframe(referrals, use_container_width=True)
+    st.write("佣金记录")
+    for commission in commissions:
+        with st.expander(f"佣金 #{commission.get('id')} ¥{commission.get('amount')} {commission.get('status')}"):
+            st.json(commission)
+            c1, c2, c3 = st.columns(3)
+            if c1.button("标记已支付", key=f"comm_paid_{commission.get('id')}"):
+                db_patch("commissions", f"?id=eq.{encode_filter_value(commission.get('id'))}", {"status": "paid"})
+                st.rerun()
+            if c2.button("取消佣金", key=f"comm_cancel_{commission.get('id')}"):
+                db_patch("commissions", f"?id=eq.{encode_filter_value(commission.get('id'))}", {"status": "cancelled"})
+                st.rerun()
+            if c3.button("设为待支付", key=f"comm_pending_{commission.get('id')}"):
+                db_patch("commissions", f"?id=eq.{encode_filter_value(commission.get('id'))}", {"status": "pending"})
+                st.rerun()
 
 
-def render_admin_panel():
-    if not st.session_state.get("user", {}).get("is_admin"):
+def render_admin_panel(user):
+    if not user.get("is_admin"):
         st.error("当前账号没有管理员权限")
         return
-
-    st.subheader("管理后台")
-    users = list_users_for_admin()
-    plans = list_plans()
-    payments = list_payments_for_admin()
-
-    user_tab, plan_tab, order_tab, stats_tab = st.tabs(["用户管理", "套餐管理", "订单管理", "数据统计"])
-    with user_tab:
-        render_admin_user_management(users, plans)
-    with plan_tab:
-        render_admin_plan_management(plans)
-    with order_tab:
-        render_admin_order_management(payments, plans)
-    with stats_tab:
-        render_admin_stats()
-
-
-def append_and_save_message(user_id, role, content, saved_content=None):
-    message = {"role": role, "content": content}
-    st.session_state.messages.append(message)
-    save_message(user_id, role, saved_content if saved_content is not None else content)
-    return message
+    st.title("管理后台")
+    s1, s2, s3, s4, s5 = admin_stats()
+    cols = st.columns(5)
+    cols[0].metric("今日用户", s1)
+    cols[1].metric("今日聊天", s2)
+    cols[2].metric("今日 Token", s3)
+    cols[3].metric("总收入", f"¥{s4:.2f}")
+    cols[4].metric("会话数", s5)
+    tabs = st.tabs(["用户", "订单", "邀请码", "推广返佣", "套餐"])
+    with tabs[0]:
+        render_admin_users(list_users_for_admin())
+    with tabs[1]:
+        render_admin_payments(list_payments_for_admin())
+    with tabs[2]:
+        render_admin_invites(list_invites_for_admin())
+    with tabs[3]:
+        render_admin_referrals(list_commissions_for_admin())
+    with tabs[4]:
+        plans = list_plans()
+        for plan in plans:
+            with st.expander(f"{plan.get('name')} ({plan.get('plan_id')})"):
+                price = st.number_input("价格", value=float(plan.get("price") or 0), key=f"plan_price_{plan.get('plan_id')}")
+                daily = st.number_input("每日次数", value=int(plan.get("daily_limit") or 0), key=f"plan_daily_{plan.get('plan_id')}")
+                token = st.number_input("每日 Token", value=int(plan.get("token_limit") or 0), key=f"plan_token_{plan.get('plan_id')}")
+                if st.button("保存套餐", key=f"save_plan_{plan.get('plan_id')}"):
+                    db_patch("plans", f"?plan_id=eq.{encode_filter_value(plan.get('plan_id'))}", {"price": price, "daily_limit": int(daily), "token_limit": int(token)})
+                    st.rerun()
 
 
 st.set_page_config(page_title="毛毛AI", page_icon="🤖", layout="wide")
+app_css()
 
 APP_SECRET = require_secret("APP_SECRET")
 OPENAI_API_KEY = require_secret("OPENAI_API_KEY")
@@ -1120,108 +1321,31 @@ validate_supabase_key(SUPABASE_KEY)
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 current_user = require_login()
-current_user_id = current_user["user_id"]
+conversation_id = ensure_active_conversation(current_user["user_id"])
+initialize_session(current_user["user_id"], conversation_id)
 
-initialize_session(current_user_id)
-model_name, search_enabled = render_sidebar(current_user)
+render_conversation_sidebar(current_user)
+render_user_sidebar(current_user)
 
-main_tab, upgrade_tab, admin_tab = st.tabs(["聊天", "会员套餐", "管理后台" if current_user.get("is_admin") else "账号"])
+main_tab, member_tab, admin_tab = st.tabs(["聊天", "会员/支付", "管理后台" if current_user.get("is_admin") else "账号"])
 
 with main_tab:
-    st.title("🤖 毛毛AI")
-    st.caption("一个可注册、可套餐限额、可管理的个人 AI 助手")
-    can_use, limit_message = can_use_ai(current_user)
-    if not can_use:
-        st.warning(limit_message)
+    render_chat(current_user, conversation_id)
 
-    uploaded_file = st.file_uploader("上传图片让 AI 分析", type=["png", "jpg", "jpeg"], key="image_upload")
-    if uploaded_file:
-        st.image(uploaded_file, caption="已上传图片", width=280)
-
-    for msg in st.session_state.messages:
-        if msg["role"] == "system":
-            continue
-        st.chat_message(msg["role"]).write(msg["content"])
-
-    question = st.chat_input("输入问题，也可以说：记住xxx / 忘记xxx", disabled=not can_use)
-
-    if (question or uploaded_file) and can_use:
-        if not question:
-            question = "请分析这张图片"
-
-        command, command_value = extract_memory_command(question)
-        if command == "remember":
-            append_and_save_message(current_user_id, "user", question)
-            st.chat_message("user").write(question)
-            if save_memory(current_user_id, command_value):
-                refresh_memories(current_user_id)
-                answer = f"已记住：{command_value}"
-            else:
-                answer = "保存长期记忆失败。"
-            append_and_save_message(current_user_id, "assistant", answer)
-            st.chat_message("assistant").write(answer)
-            st.stop()
-
-        if command == "forget":
-            append_and_save_message(current_user_id, "user", question)
-            st.chat_message("user").write(question)
-            deleted_count = forget_memories(current_user_id, command_value)
-            answer = f"已忘记与“{command_value}”相关的 {deleted_count} 条记忆。" if deleted_count else f"没有找到与“{command_value}”相关的长期记忆。"
-            append_and_save_message(current_user_id, "assistant", answer)
-            st.chat_message("assistant").write(answer)
-            st.stop()
-
-        search_context = get_search_context(question, search_enabled)
-        reset_system_message(search_enabled, search_context)
-
-        if uploaded_file:
-            user_message = {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": question},
-                    {"type": "image_url", "image_url": {"url": encode_uploaded_image(uploaded_file)}},
-                ],
-            }
-            save_content = f"{question}【已上传图片】"
-        else:
-            user_message = {"role": "user", "content": question}
-            save_content = question
-
-        st.session_state.messages.append(user_message)
-        save_message(current_user_id, "user", save_content)
-        st.chat_message("user").write(question)
-
-        with st.chat_message("assistant"):
-            with st.spinner("正在思考..."):
-                try:
-                    response = client.chat.completions.create(model=model_name, messages=st.session_state.messages)
-                    answer = response.choices[0].message.content or ""
-                    st.write(answer)
-                except Exception as exc:
-                    st.error(f"AI 请求失败：{exc}")
-                    st.stop()
-
-        st.session_state.messages.append({"role": "assistant", "content": answer})
-        save_message(current_user_id, "assistant", answer)
-        if getattr(response, "usage", None):
-            record_usage(current_user_id, model_name, response.usage)
-
-with upgrade_tab:
+with member_tab:
     render_upgrade_panel(current_user)
 
 with admin_tab:
     if current_user.get("is_admin"):
-        render_admin_panel()
+        render_admin_panel(current_user)
     else:
-        st.subheader("账号信息")
         plan, daily_limit, token_limit, monthly_limit, monthly_token_limit, is_expired = effective_limits(current_user)
-        calls_today, tokens_today = load_today_usage(current_user_id)
+        st.subheader("账号信息")
         st.write(f"用户名：{current_user.get('username')}")
         st.write(f"邮箱：{current_user.get('email')}")
         st.write(f"套餐：{plan.get('name')}")
-        st.write(f"今日次数：{calls_today}/{daily_limit}")
-        st.write(f"今日剩余 tokens：{max(token_limit - tokens_today, 0)}")
-        st.write(f"每月次数上限：{monthly_limit}")
-        st.write(f"每月 tokens 上限：{monthly_token_limit}")
+        st.write(f"推广码：`{current_user.get('referral_code')}`")
+        st.write(f"每日次数：{daily_limit}，每日 Token：{token_limit}")
+        st.write(f"每月次数：{monthly_limit}，每月 Token：{monthly_token_limit}")
         if is_expired:
             st.warning("套餐已过期")
