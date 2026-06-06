@@ -1,153 +1,237 @@
 # 毛毛AI Streamlit 助手
 
-一个基于 Streamlit、OpenAI 和 Supabase 的多用户 AI 助手，支持账号注册登录、聊天记录、长期记忆、图片分析、模型切换、会员套餐、使用统计和管理后台。代码中不保存任何 API Key，所有密钥都从 Streamlit Secrets 读取。
+毛毛AI 是一个基于 Streamlit、OpenAI 和 Supabase 的多用户 AI 助手，支持注册登录、长期记忆、图片分析、套餐额度、Token 统计、支付接口预留和管理后台。
 
-## 功能
+## 核心功能
 
 - 用户注册 / 登录：用户名、邮箱、密码
-- 密码哈希保存：不会明文保存用户密码
-- 多用户隔离：每个用户独立拥有 `chat_history`、`memories`、`usage_logs`
-- OpenAI 聊天
-- 图片上传分析
-- GPT-5 / GPT-5-mini / GPT-5-nano 模型切换
-- Supabase 保存、读取、清空聊天记录
-- Supabase 保存、读取、删除、清空长期记忆
-- 输入 `记住xxx` 自动保存长期记忆
+- 密码哈希加密保存：不保存明文密码
+- 每个用户独立 `user_id`
+- 每个用户独立 `chat_history`、`memories`、`usage_logs`
+- 模型选择：`gpt-5` / `gpt-5.5` / `gpt-5-mini`
+- 图片上传后自动分析
+- 输入 `记住xxx` 自动写入长期记忆
 - 输入 `忘记xxx` 自动删除相关长期记忆
-- 联网搜索开关：已预留 Tavily / SerpAPI / Bing Search 接口
-- 会员套餐：免费版、月付版、年付版
-- 免费版每日使用次数限制
-- 付费版每日次数和 token 限额更高
-- 支付接口预留：Stripe、支付宝、微信支付
-- 管理后台：查看用户、使用次数、套餐，修改套餐，禁用用户，清空聊天记录
+- 套餐系统：免费版、普通版、高级版
+- 每日 / 每月使用次数限制
+- 每日 / 每月 Token 限制
+- `usage_logs` 记录每次 GPT 调用的 token 消耗
+- 支付接口预留：支付宝、微信支付按钮占位
+- 管理后台：查看用户、修改套餐和额度、禁用用户、清空聊天记录
 
 ## Streamlit Secrets
 
 在 Streamlit Cloud 的 Secrets 中配置：
 
 ```toml
+APP_SECRET = "请填写一个随机长字符串"
 OPENAI_API_KEY = "你的 OpenAI API Key"
 SUPABASE_URL = "https://你的项目.supabase.co"
-SUPABASE_KEY = "你的 Supabase anon key 或 service role key"
+SUPABASE_KEY = "你的 Supabase service_role key"
 SUPABASE_SCHEMA = "public"
 
-# 可选：支付接口占位配置，当前不会发起真实扣款
-PAYMENT_PROVIDER = "placeholder"
-STRIPE_SECRET_KEY = ""
+# 可选：未来接入真实支付网关时替换
+PAYMENT_GATEWAY_URL = "https://example.com/pay"
 ALIPAY_APP_ID = ""
 WECHAT_PAY_MCH_ID = ""
 ```
 
 安全要求：
 
-- 不要把任何 API Key 写进代码
-- 不要把完整密钥显示在页面上
-- Streamlit Secrets 只在服务端读取
-- `SUPABASE_URL` 推荐填写项目根地址，例如 `https://xxxx.supabase.co`，不要填写 `https://xxxx.supabase.co/rest/v1`
-- 如果你填写了带 `/rest/v1` 的地址，当前代码会自动纠正
-- 这个项目使用自建账号系统，推荐 `SUPABASE_KEY` 使用 `service_role key`，只放在 Streamlit Secrets，不要放到前端页面或公开仓库
-- 如果启用 RLS，请确保策略和你的 Supabase Key 匹配；使用 `service_role key` 时通常可以直接绕过 RLS
+- `SUPABASE_KEY` 必须使用 `service_role key`，不要使用 anon key
+- `service_role key` 只放在 Streamlit Secrets，不要写进 GitHub
+- `SUPABASE_URL` 填项目根地址，例如 `https://xxxx.supabase.co`
+- 不要在页面上显示完整密钥
 
-## 首个管理员
+## Supabase SQL
 
-先在页面注册一个普通账号，然后在 Supabase SQL Editor 中把它设为管理员：
+在 Supabase SQL Editor 中执行下面脚本。它可以重复执行，会自动补齐旧表缺失字段。
 
 ```sql
-update public.users
-set is_admin = true
-where email = '你的邮箱@example.com';
-```
+create extension if not exists pgcrypto;
 
-重新登录后会看到“管理后台”页面。
-
-## Supabase 数据库 SQL
-
-在 Supabase SQL Editor 中执行以下 SQL：
-
-```sql
 create table if not exists public.users (
   id bigint generated always as identity primary key,
-  user_id text not null unique,
-  username text not null unique,
-  email text not null unique,
-  password_hash text not null,
-  password_salt text not null,
-  plan text not null default 'free',
+  user_id text,
+  username text,
+  email text,
+  password_hash text,
+  password_salt text,
+  plan text default 'free',
+  plan_id text default 'free',
   expire_at timestamptz,
-  daily_limit integer not null default 20,
-  token_limit integer not null default 50000,
-  is_admin boolean not null default false,
-  disabled boolean not null default false,
-  created_at timestamptz not null default now()
+  daily_limit integer default 20,
+  token_limit integer default 50000,
+  monthly_limit integer default 300,
+  monthly_token_limit integer default 1000000,
+  is_admin boolean default false,
+  disabled boolean default false,
+  created_at timestamptz default now()
 );
 
-create index if not exists users_email_idx
-  on public.users (email);
+alter table public.users add column if not exists user_id text;
+alter table public.users add column if not exists username text;
+alter table public.users add column if not exists email text;
+alter table public.users add column if not exists password_hash text;
+alter table public.users add column if not exists password_salt text;
+alter table public.users add column if not exists plan text default 'free';
+alter table public.users add column if not exists plan_id text default 'free';
+alter table public.users add column if not exists expire_at timestamptz;
+alter table public.users add column if not exists daily_limit integer default 20;
+alter table public.users add column if not exists token_limit integer default 50000;
+alter table public.users add column if not exists monthly_limit integer default 300;
+alter table public.users add column if not exists monthly_token_limit integer default 1000000;
+alter table public.users add column if not exists is_admin boolean default false;
+alter table public.users add column if not exists disabled boolean default false;
+alter table public.users add column if not exists created_at timestamptz default now();
 
-create index if not exists users_username_idx
-  on public.users (username);
+do $$
+begin
+  if exists (
+    select 1 from information_schema.columns
+    where table_schema = 'public' and table_name = 'users' and column_name = 'password'
+  ) then
+    alter table public.users alter column password drop not null;
+  end if;
+
+  if exists (
+    select 1 from information_schema.columns
+    where table_schema = 'public' and table_name = 'users' and column_name = 'plan_id' and data_type <> 'text'
+  ) then
+    alter table public.users alter column plan_id type text using plan_id::text;
+  end if;
+
+  if exists (
+    select 1 from information_schema.columns
+    where table_schema = 'public' and table_name = 'users' and column_name = 'plan' and data_type <> 'text'
+  ) then
+    alter table public.users alter column plan type text using plan::text;
+  end if;
+end $$;
+
+update public.users set user_id = gen_random_uuid()::text where user_id is null;
+update public.users set plan_id = coalesce(nullif(plan_id, ''), nullif(plan, ''), 'free');
+update public.users set plan = coalesce(nullif(plan, ''), plan_id, 'free');
+update public.users set daily_limit = coalesce(daily_limit, 20);
+update public.users set token_limit = coalesce(token_limit, 50000);
+update public.users set monthly_limit = coalesce(monthly_limit, 300);
+update public.users set monthly_token_limit = coalesce(monthly_token_limit, 1000000);
+update public.users set is_admin = coalesce(is_admin, false);
+update public.users set disabled = coalesce(disabled, false);
+
+create unique index if not exists users_user_id_unique on public.users (user_id);
+create unique index if not exists users_username_unique on public.users (username);
+create unique index if not exists users_email_unique on public.users (email);
 
 create table if not exists public.plans (
-  plan_id text primary key,
+  id bigint generated always as identity primary key,
+  plan_id text,
   name text not null,
-  price numeric(10, 2) not null default 0,
-  billing_cycle text not null default 'free',
-  daily_limit integer not null default 20,
-  token_limit integer not null default 50000,
+  price numeric(10, 2) default 0,
+  billing_cycle text default 'free',
+  daily_limit integer default 20,
+  token_limit integer default 50000,
+  monthly_limit integer default 300,
+  monthly_token_limit integer default 1000000,
   description text,
-  created_at timestamptz not null default now()
+  created_at timestamptz default now()
 );
 
-insert into public.plans (plan_id, name, price, billing_cycle, daily_limit, token_limit, description)
+alter table public.plans add column if not exists plan_id text;
+alter table public.plans add column if not exists price numeric(10, 2) default 0;
+alter table public.plans add column if not exists billing_cycle text default 'free';
+alter table public.plans add column if not exists daily_limit integer default 20;
+alter table public.plans add column if not exists token_limit integer default 50000;
+alter table public.plans add column if not exists monthly_limit integer default 300;
+alter table public.plans add column if not exists monthly_token_limit integer default 1000000;
+alter table public.plans add column if not exists description text;
+alter table public.plans add column if not exists created_at timestamptz default now();
+
+do $$
+begin
+  if exists (
+    select 1 from information_schema.columns
+    where table_schema = 'public' and table_name = 'plans' and column_name = 'plan_id' and data_type <> 'text'
+  ) then
+    alter table public.plans alter column plan_id type text using plan_id::text;
+  end if;
+end $$;
+
+create unique index if not exists plans_plan_id_unique on public.plans (plan_id);
+
+insert into public.plans (
+  plan_id, name, price, billing_cycle,
+  daily_limit, token_limit, monthly_limit, monthly_token_limit, description
+)
 values
-  ('free', '免费版', 0, 'free', 20, 50000, '适合试用，每天有限次数和 token。'),
-  ('monthly', '月付版', 29, 'monthly', 300, 1000000, '适合日常高频使用，按月开通。'),
-  ('yearly', '年付版', 299, 'yearly', 1000, 5000000, '适合长期使用，额度更高。')
-on conflict (plan_id) do update
-set
+  ('free', '免费版', 0, 'free', 20, 50000, 300, 1000000, '适合试用，每日和每月额度较低。'),
+  ('basic', '普通版', 29, 'monthly', 300, 1000000, 6000, 20000000, '适合日常高频使用。'),
+  ('pro', '高级版', 99, 'monthly', 1000, 5000000, 30000, 100000000, '适合重度使用和商业场景。')
+on conflict (plan_id) do update set
   name = excluded.name,
   price = excluded.price,
   billing_cycle = excluded.billing_cycle,
   daily_limit = excluded.daily_limit,
   token_limit = excluded.token_limit,
+  monthly_limit = excluded.monthly_limit,
+  monthly_token_limit = excluded.monthly_token_limit,
   description = excluded.description;
 
 create table if not exists public.payments (
   id bigint generated always as identity primary key,
-  payment_id text unique,
   user_id text not null,
-  plan text not null,
-  provider text not null,
-  amount numeric(10, 2) not null default 0,
-  currency text not null default 'CNY',
-  status text not null default 'pending',
-  raw_payload jsonb,
-  created_at timestamptz not null default now()
+  plan_id text not null,
+  amount numeric(10, 2) default 0,
+  status text default 'pending',
+  method text default 'placeholder',
+  created_at timestamptz default now()
 );
 
-create index if not exists payments_user_id_created_at_idx
-  on public.payments (user_id, created_at desc);
+alter table public.payments add column if not exists user_id text;
+alter table public.payments add column if not exists plan_id text;
+alter table public.payments add column if not exists amount numeric(10, 2) default 0;
+alter table public.payments add column if not exists status text default 'pending';
+alter table public.payments add column if not exists method text default 'placeholder';
+alter table public.payments add column if not exists created_at timestamptz default now();
+
+do $$
+begin
+  if exists (
+    select 1 from information_schema.columns
+    where table_schema = 'public' and table_name = 'payments' and column_name = 'plan_id' and data_type <> 'text'
+  ) then
+    alter table public.payments alter column plan_id type text using plan_id::text;
+  end if;
+
+  if exists (
+    select 1 from information_schema.columns
+    where table_schema = 'public' and table_name = 'payments' and column_name = 'plan'
+  ) then
+    alter table public.payments alter column plan drop not null;
+  end if;
+
+  if exists (
+    select 1 from information_schema.columns
+    where table_schema = 'public' and table_name = 'payments' and column_name = 'provider'
+  ) then
+    alter table public.payments alter column provider drop not null;
+  end if;
+end $$;
 
 create table if not exists public.chat_history (
   id bigint generated always as identity primary key,
   user_id text not null,
   role text not null check (role in ('user', 'assistant')),
   content text not null,
-  created_at timestamptz not null default now()
+  created_at timestamptz default now()
 );
-
-create index if not exists chat_history_user_id_id_idx
-  on public.chat_history (user_id, id);
 
 create table if not exists public.memories (
   id bigint generated always as identity primary key,
   user_id text not null,
   memory text not null,
-  created_at timestamptz not null default now()
+  created_at timestamptz default now()
 );
-
-create index if not exists memories_user_id_id_idx
-  on public.memories (user_id, id);
 
 create table if not exists public.usage_logs (
   id bigint generated always as identity primary key,
@@ -159,190 +243,65 @@ create table if not exists public.usage_logs (
   created_at timestamptz default now()
 );
 
-create index if not exists usage_logs_user_id_created_at_idx
-  on public.usage_logs (user_id, created_at desc);
+create index if not exists chat_history_user_id_id_idx on public.chat_history (user_id, id);
+create index if not exists memories_user_id_id_idx on public.memories (user_id, id);
+create index if not exists usage_logs_user_id_created_at_idx on public.usage_logs (user_id, created_at desc);
+create index if not exists payments_user_id_created_at_idx on public.payments (user_id, created_at desc);
 
-grant usage on schema public to anon, authenticated, service_role;
+grant usage on schema public to service_role;
 grant all privileges on all tables in schema public to service_role;
 grant all privileges on all sequences in schema public to service_role;
 
-grant select, insert, update, delete on public.users to service_role;
-grant select, insert, update, delete on public.plans to service_role;
-grant select, insert, update, delete on public.payments to service_role;
-grant select, insert, update, delete on public.chat_history to service_role;
-grant select, insert, update, delete on public.memories to service_role;
-grant select, insert, update, delete on public.usage_logs to service_role;
-
-notify pgrst, 'reload schema';
-```
-
-如果这是一个由 Streamlit 后端统一访问 Supabase 的项目，可以先关闭 RLS：
-
-```sql
 alter table public.users disable row level security;
 alter table public.plans disable row level security;
 alter table public.payments disable row level security;
 alter table public.chat_history disable row level security;
 alter table public.memories disable row level security;
 alter table public.usage_logs disable row level security;
-```
-
-如果你要开启 RLS，并且 `SUPABASE_KEY` 使用的是 `service_role key`，可以使用下面的策略。`service_role` 仍然只应该放在 Streamlit Secrets 中：
-
-```sql
-alter table public.users enable row level security;
-alter table public.plans enable row level security;
-alter table public.payments enable row level security;
-alter table public.chat_history enable row level security;
-alter table public.memories enable row level security;
-alter table public.usage_logs enable row level security;
-
-drop policy if exists "service_role_all_users" on public.users;
-create policy "service_role_all_users"
-on public.users
-for all
-to service_role
-using (true)
-with check (true);
-
-drop policy if exists "service_role_all_plans" on public.plans;
-create policy "service_role_all_plans"
-on public.plans
-for all
-to service_role
-using (true)
-with check (true);
-
-drop policy if exists "service_role_all_payments" on public.payments;
-create policy "service_role_all_payments"
-on public.payments
-for all
-to service_role
-using (true)
-with check (true);
-
-drop policy if exists "service_role_all_chat_history" on public.chat_history;
-create policy "service_role_all_chat_history"
-on public.chat_history
-for all
-to service_role
-using (true)
-with check (true);
-
-drop policy if exists "service_role_all_memories" on public.memories;
-create policy "service_role_all_memories"
-on public.memories
-for all
-to service_role
-using (true)
-with check (true);
-
-drop policy if exists "service_role_all_usage_logs" on public.usage_logs;
-create policy "service_role_all_usage_logs"
-on public.usage_logs
-for all
-to service_role
-using (true)
-with check (true);
 
 notify pgrst, 'reload schema';
 ```
 
-注意：这个项目的普通用户账号不是 Supabase Auth 用户，而是保存在 `public.users` 的自建账号。因此不要给 `anon` 写宽松的“全表读写”RLS 策略，否则普通用户可能通过 API 访问别人的数据。生产部署建议只让 Streamlit 服务端用 `service_role key` 访问 Supabase，应用代码用 `user_id` 做数据隔离。
+## 首个管理员
 
-## 如果注册时报 404
-
-如果你已经执行 SQL 但页面仍显示：
-
-- `读取 users 失败：404`
-- `读取 plans 失败：404`
-- `写入 users 失败：404`
-
-请在 Supabase SQL Editor 再执行：
+先注册一个普通账号，然后在 Supabase SQL Editor 中执行：
 
 ```sql
-select table_schema, table_name
-from information_schema.tables
-where table_schema = 'public'
-  and table_name in ('users', 'plans', 'payments', 'chat_history', 'memories', 'usage_logs')
-order by table_name;
-
-notify pgrst, 'reload schema';
+update public.users
+set is_admin = true
+where email = '你的邮箱@example.com';
 ```
 
-你应该看到 6 张表都在 `public` schema 下：
+重新登录后会看到“管理后台”。
 
-- `users`
-- `plans`
-- `payments`
-- `chat_history`
-- `memories`
-- `usage_logs`
+## 支付接口预留
 
-如果查不到这些表，说明表没有建在 `public` schema，需要重新执行上面的完整建表 SQL。
-
-## 表说明
-
-### `users`
-
-保存注册用户、会员套餐和权限状态。
-
-- `user_id`：每个用户独立 ID
-- `username`：用户名
-- `email`：邮箱
-- `password_hash`：密码哈希
-- `password_salt`：密码盐
-- `plan`：当前套餐
-- `expire_at`：套餐过期时间
-- `daily_limit`：每日请求次数上限
-- `token_limit`：每日 token 上限
-- `is_admin`：是否管理员
-- `disabled`：是否禁用
-
-### `plans`
-
-保存会员套餐。
-
-- `plan_id`：`free`、`monthly`、`yearly`
-- `name`：套餐名称
-- `price`：价格
-- `billing_cycle`：计费周期
-- `daily_limit`：每日请求次数上限
-- `token_limit`：每日 token 上限
-- `description`：套餐说明
-
-### `payments`
-
-支付记录预留表，后续接入 Stripe、支付宝或微信支付时使用。
-
-### `chat_history`
-
-保存每个用户的聊天记录。
-
-### `memories`
-
-保存每个用户的长期记忆。
-
-### `usage_logs`
-
-保存每次 OpenAI 请求后的 token 使用情况。
-
-应用写入 `usage_logs` 时只写以下字段：
+当前 `app.py` 会在点击“支付宝开通”或“微信支付开通”时向 `payments` 表写入一条 `pending` 记录：
 
 - `user_id`
-- `model`
-- `prompt_tokens`
-- `completion_tokens`
-- `total_tokens`
+- `plan_id`
+- `amount`
+- `status`
+- `method`
+- `created_at`
 
-`created_at` 由数据库默认值自动生成。
+未来接入真实支付时，把 `PAYMENT_GATEWAY_URL` 替换为真实网关地址，并在支付回调中把 `payments.status` 更新为 `paid`，再更新用户的 `plan_id`、`daily_limit`、`token_limit`、`monthly_limit`、`monthly_token_limit`。
 
-## 联网搜索预留
+## 部署前测试步骤
 
-页面里已经有“启用联网搜索”开关。目前代码中的 `get_search_context()` 是预留接口，后续可以在这里接入：
+1. 在 Supabase SQL Editor 执行上面的完整 SQL。
+2. 在 Streamlit Secrets 配置 `APP_SECRET`、`OPENAI_API_KEY`、`SUPABASE_URL`、`SUPABASE_KEY`、`SUPABASE_SCHEMA`。
+3. 确认 `SUPABASE_KEY` 是 `service_role key`，不是 anon key。
+4. 重启 Streamlit Cloud 应用。
+5. 注册一个新用户，确认 `users` 表新增记录，且 `plan_id = 'free'`。
+6. 登录该用户，发送一条聊天消息，确认 `chat_history` 和 `usage_logs` 写入。
+7. 输入 `记住我喜欢简洁回答`，确认 `memories` 写入。
+8. 刷新页面，确认聊天记录和长期记忆仍正常显示。
+9. 上传一张图片，确认会自动触发图片分析。
+10. 将该用户设置为管理员，重新登录后进入管理后台，测试修改套餐、额度、禁用用户、清空聊天记录。
 
-- Tavily
-- SerpAPI
-- Bing Search API
+## 常见问题
 
-接入后，把搜索结果整理成简短上下文返回，应用会把它加入 system prompt。
+- `SUPABASE_KEY 当前是 anon key`：请在 Streamlit Secrets 改为 service_role key。
+- `读取 users 失败：404`：确认表在 `public` schema 下，并执行 `notify pgrst, 'reload schema';`。
+- 支付按钮只写入 pending 记录：这是预留接口，当前不会真实扣款。
