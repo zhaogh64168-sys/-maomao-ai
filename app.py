@@ -5,7 +5,7 @@ import json
 import os
 import re
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
 import requests
@@ -575,7 +575,7 @@ def record_usage(user_id, model, usage):
     )
 
 
-def create_payment_placeholder(user_id, plan, method):
+def create_payment_order(user_id, plan):
     plan_id = plan.get("plan_id") or DEFAULT_PLAN_ID
     amount = float(plan.get("price") or 0)
     payment = {
@@ -583,29 +583,64 @@ def create_payment_placeholder(user_id, plan, method):
         "plan_id": plan_id,
         "amount": amount,
         "status": "pending",
-        "method": method,
         "created_at": utc_now_iso(),
     }
-    return bool(db_insert("payments", payment))
+    rows = db_insert("payments", payment, return_rows=True)
+    return rows[0] if rows else None
+
+
+def render_qr_image(label, secret_name, upload_key):
+    qr_url = get_secret(secret_name, "")
+    uploaded_qr = st.file_uploader(f"上传{label}收款码", type=["png", "jpg", "jpeg"], key=upload_key)
+    if uploaded_qr:
+        st.image(uploaded_qr, caption=label, width=220)
+        return
+    if qr_url:
+        st.image(qr_url, caption=label, width=220)
+        return
+    st.caption(f"可上传{label}收款码，或在 Streamlit Secrets 配置 `{secret_name}` 图片链接。")
+
+
+def render_payment_page(order, plan):
+    st.success(f"订单已创建：#{order.get('id')}，状态：待支付")
+    st.write(f"购买套餐：**{plan.get('name', plan.get('plan_id'))}**")
+    st.write(f"应付金额：**{format_money(order.get('amount'))}**")
+    st.info("请付款后联系管理员审核开通")
+    st.caption("这里保留支付宝官方 API / 微信支付 API 的接入位置，后续可替换为真实支付网关回调。")
+
+    qr_cols = st.columns(2)
+    with qr_cols[0]:
+        st.markdown("##### 支付宝收款码")
+        render_qr_image("支付宝", "ALIPAY_QR_IMAGE_URL", f"alipay_qr_{order.get('id')}")
+    with qr_cols[1]:
+        st.markdown("##### 微信收款码")
+        render_qr_image("微信", "WECHAT_QR_IMAGE_URL", f"wechat_qr_{order.get('id')}")
 
 
 def render_upgrade_panel(user):
     st.subheader("开通会员 / 升级套餐")
     gateway_url = get_secret("PAYMENT_GATEWAY_URL", "https://example.com/pay")
-    st.caption("支付接口已预留，后续可接入支付宝、微信支付或真实支付网关。支付密钥请放在 Streamlit Secrets。")
+    st.caption("当前为简易人工审核支付。后续可接入支付宝官方 API、微信支付 API 或真实支付网关。支付密钥请放在 Streamlit Secrets。")
+
+    latest_order = st.session_state.get("latest_payment_order")
+    latest_plan = st.session_state.get("latest_payment_plan")
+    if latest_order and latest_plan:
+        render_payment_page(latest_order, latest_plan)
+        st.divider()
+
     for plan in list_plans():
         with st.container(border=True):
             st.write(f"**{plan.get('name', plan.get('plan_id'))}**")
             st.write(f"每日次数：{plan.get('daily_limit')} ｜ 每日 tokens：{plan.get('token_limit')}")
             st.write(f"每月次数：{plan.get('monthly_limit')} ｜ 每月 tokens：{plan.get('monthly_token_limit')}")
             st.write(f"价格：{plan.get('price', 0)} / {plan.get('billing_cycle', 'free')}")
-            cols = st.columns(2)
-            if cols[0].button("支付宝开通", key=f"alipay_{plan.get('plan_id')}"):
-                if create_payment_placeholder(user["user_id"], plan, "alipay"):
-                    st.info(f"已创建支付宝支付占位订单。未来可跳转到：{gateway_url}?method=alipay&plan_id={plan.get('plan_id')}")
-            if cols[1].button("微信支付开通", key=f"wechat_{plan.get('plan_id')}"):
-                if create_payment_placeholder(user["user_id"], plan, "wechat"):
-                    st.info(f"已创建微信支付占位订单。未来可跳转到：{gateway_url}?method=wechat&plan_id={plan.get('plan_id')}")
+            if st.button("购买套餐", key=f"buy_{plan.get('plan_id')}", use_container_width=True):
+                order = create_payment_order(user["user_id"], plan)
+                if order:
+                    st.session_state.latest_payment_order = order
+                    st.session_state.latest_payment_plan = plan
+                    st.info(f"已创建待支付订单。未来可接入支付网关：{gateway_url}?plan_id={plan.get('plan_id')}")
+                    st.rerun()
 
 
 def render_memory_manager(user_id):
@@ -729,6 +764,65 @@ def update_payment_status(payment_id, status):
     return db_patch("payments", f"?id=eq.{encode_filter_value(payment_id)}", {"status": status})
 
 
+def plan_expire_at(plan):
+    billing_cycle = plan.get("billing_cycle") or "free"
+    days_by_cycle = {
+        "monthly": 30,
+        "quarterly": 90,
+        "yearly": 365,
+    }
+    days = days_by_cycle.get(billing_cycle)
+    if not days:
+        return None
+    return (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
+
+
+def open_membership(user_id, plan_id):
+    plan = get_plan(plan_id)
+    return db_patch(
+        "users",
+        f"?user_id=eq.{encode_filter_value(user_id)}",
+        {
+            "plan_id": plan.get("plan_id") or DEFAULT_PLAN_ID,
+            "plan": plan.get("plan_id") or DEFAULT_PLAN_ID,
+            "daily_limit": int(plan.get("daily_limit") or DEFAULT_DAILY_LIMIT),
+            "token_limit": int(plan.get("token_limit") or DEFAULT_TOKEN_LIMIT),
+            "monthly_limit": int(plan.get("monthly_limit") or DEFAULT_MONTHLY_LIMIT),
+            "monthly_token_limit": int(plan.get("monthly_token_limit") or DEFAULT_MONTHLY_TOKEN_LIMIT),
+            "expire_at": plan_expire_at(plan),
+        },
+    )
+
+
+def close_membership(user_id):
+    free_plan = get_plan(FREE_PLAN_ID)
+    return db_patch(
+        "users",
+        f"?user_id=eq.{encode_filter_value(user_id)}",
+        {
+            "plan_id": FREE_PLAN_ID,
+            "plan": FREE_PLAN_ID,
+            "daily_limit": int(free_plan.get("daily_limit") or DEFAULT_DAILY_LIMIT),
+            "token_limit": int(free_plan.get("token_limit") or DEFAULT_TOKEN_LIMIT),
+            "monthly_limit": int(free_plan.get("monthly_limit") or DEFAULT_MONTHLY_LIMIT),
+            "monthly_token_limit": int(free_plan.get("monthly_token_limit") or DEFAULT_MONTHLY_TOKEN_LIMIT),
+            "expire_at": None,
+        },
+    )
+
+
+def approve_payment_order(payment):
+    user_id = payment.get("user_id")
+    plan_id = payment.get("plan_id") or DEFAULT_PLAN_ID
+    payment_id = payment.get("id")
+    if not user_id or not payment_id:
+        st.error("订单缺少 user_id 或 id，无法开通")
+        return False
+    membership_ok = open_membership(user_id, plan_id)
+    status_ok = update_payment_status(payment_id, "paid")
+    return membership_ok and status_ok
+
+
 def render_admin_user_management(users, plans):
     st.markdown("#### 用户管理")
     search = st.text_input("搜索用户", placeholder="输入用户名、邮箱或 user_id")
@@ -804,7 +898,7 @@ def render_admin_user_management(users, plans):
             disabled = st.checkbox("封禁用户", value=bool(user.get("disabled")), key=f"admin_disabled_{user_id}")
             is_admin = st.checkbox("管理员", value=bool(user.get("is_admin")), key=f"admin_is_admin_{user_id}")
 
-            save_col, clear_col, delete_col = st.columns(3)
+            save_col, close_col, clear_col, delete_col = st.columns(4)
             if save_col.button("保存用户", key=f"admin_save_user_{user_id}"):
                 db_patch(
                     "users",
@@ -822,6 +916,9 @@ def render_admin_user_management(users, plans):
                     },
                 )
                 st.rerun()
+            if close_col.button("关闭会员", key=f"admin_close_membership_{user_id}"):
+                if close_membership(user_id):
+                    st.rerun()
             if clear_col.button("清空聊天", key=f"admin_clear_chat_{user_id}"):
                 clear_messages(user_id)
                 st.rerun()
@@ -922,7 +1019,6 @@ def render_admin_order_management(payments, plans):
             for payment in payments
             if keyword in str(payment.get("user_id", "")).lower()
             or keyword in str(payment.get("plan_id", "")).lower()
-            or keyword in str(payment.get("method", "")).lower()
             or keyword in str(payment.get("status", "")).lower()
         ]
     st.caption(f"共 {len(payments)} 条订单")
@@ -933,26 +1029,48 @@ def render_admin_order_management(payments, plans):
         st.info("暂无支付订单")
         return
 
-    for payment in payments:
-        payment_id = payment.get("id")
-        plan_id = payment.get("plan_id")
-        title = f"订单 #{payment_id} · {payment.get('user_id')} · {format_money(payment.get('amount'))}"
-        with st.expander(title):
-            st.write(f"用户：`{payment.get('user_id')}`")
-            st.write(f"套餐：{name_map.get(plan_id, plan_id)} ({plan_id})")
-            st.write(f"金额：{format_money(payment.get('amount'))}")
-            st.write(f"支付方式：{payment.get('method') or 'placeholder'}")
-            st.write(f"创建时间：{payment.get('created_at')}")
-            current_status = payment.get("status") or "pending"
-            status = st.selectbox(
-                "支付状态",
-                status_options,
-                index=status_options.index(current_status) if current_status in status_options else 0,
-                key=f"payment_status_{payment_id}",
-            )
-            if st.button("更新订单状态", key=f"payment_save_{payment_id}"):
-                if update_payment_status(payment_id, status):
-                    st.rerun()
+    def render_order_rows(order_rows, prefix):
+        if not order_rows:
+            st.info("暂无订单")
+            return
+        for payment in order_rows:
+            payment_id = payment.get("id")
+            plan_id = payment.get("plan_id")
+            status_text = payment.get("status") or "pending"
+            title = f"订单 #{payment_id} · {status_text} · {payment.get('user_id')} · {format_money(payment.get('amount'))}"
+            with st.expander(title):
+                st.write(f"用户：`{payment.get('user_id')}`")
+                st.write(f"套餐：{name_map.get(plan_id, plan_id)} ({plan_id})")
+                st.write(f"金额：{format_money(payment.get('amount'))}")
+                st.write(f"状态：{status_text}")
+                st.write(f"创建时间：{payment.get('created_at')}")
+                status = st.selectbox(
+                    "支付状态",
+                    status_options,
+                    index=status_options.index(status_text) if status_text in status_options else 0,
+                    key=f"{prefix}_payment_status_{payment_id}",
+                )
+                col_a, col_b, col_c = st.columns(3)
+                if col_a.button("更新状态", key=f"{prefix}_payment_save_{payment_id}"):
+                    if update_payment_status(payment_id, status):
+                        st.rerun()
+                if col_b.button("审核开通会员", key=f"{prefix}_payment_open_{payment_id}"):
+                    if approve_payment_order(payment):
+                        st.rerun()
+                if col_c.button("关闭该用户会员", key=f"{prefix}_payment_close_{payment_id}"):
+                    if close_membership(payment.get("user_id")):
+                        st.rerun()
+
+    pending_orders = [payment for payment in payments if (payment.get("status") or "pending") == "pending"]
+    paid_orders = [payment for payment in payments if payment.get("status") == "paid"]
+
+    pending_tab, paid_tab, all_tab = st.tabs(["待支付订单", "已支付订单", "全部订单"])
+    with pending_tab:
+        render_order_rows(pending_orders, "pending")
+    with paid_tab:
+        render_order_rows(paid_orders, "paid")
+    with all_tab:
+        render_order_rows(payments, "all")
 
 
 def render_admin_stats():
