@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import hmac
+import json
 import os
 import re
 import uuid
@@ -12,12 +13,50 @@ import streamlit as st
 from openai import OpenAI
 
 
-MODEL_OPTIONS = ["gpt-5", "gpt-5-mini", "gpt-5-nano"]
+MODEL_OPTIONS = ["gpt-5", "gpt-5.5", "gpt-5-mini"]
 FREE_PLAN_ID = "free"
+DEFAULT_PLAN_ID = FREE_PLAN_ID
 DEFAULT_DAILY_LIMIT = 20
 DEFAULT_TOKEN_LIMIT = 50000
+DEFAULT_MONTHLY_LIMIT = 300
+DEFAULT_MONTHLY_TOKEN_LIMIT = 1000000
 PASSWORD_ITERATIONS = 200000
 SUPABASE_TABLES = {"users", "plans", "payments", "chat_history", "memories", "usage_logs"}
+FALLBACK_PLANS = [
+    {
+        "plan_id": "free",
+        "name": "免费版",
+        "price": 0,
+        "billing_cycle": "free",
+        "daily_limit": 20,
+        "token_limit": 50000,
+        "monthly_limit": 300,
+        "monthly_token_limit": 1000000,
+        "description": "适合试用，每日和每月额度较低。",
+    },
+    {
+        "plan_id": "basic",
+        "name": "普通版",
+        "price": 29,
+        "billing_cycle": "monthly",
+        "daily_limit": 300,
+        "token_limit": 1000000,
+        "monthly_limit": 6000,
+        "monthly_token_limit": 20000000,
+        "description": "适合日常高频使用。",
+    },
+    {
+        "plan_id": "pro",
+        "name": "高级版",
+        "price": 99,
+        "billing_cycle": "monthly",
+        "daily_limit": 1000,
+        "token_limit": 5000000,
+        "monthly_limit": 30000,
+        "monthly_token_limit": 100000000,
+        "description": "适合重度使用和商业场景。",
+    },
+]
 
 
 def get_secret(name, default=None):
@@ -42,6 +81,25 @@ def normalize_supabase_url(value):
     if url.endswith("/rest"):
         url = url[: -len("/rest")].rstrip("/")
     return url
+
+
+def jwt_role(token):
+    parts = str(token or "").split(".")
+    if len(parts) < 2:
+        return ""
+    payload = parts[1] + "=" * (-len(parts[1]) % 4)
+    try:
+        data = json.loads(base64.urlsafe_b64decode(payload.encode("utf-8")).decode("utf-8"))
+    except Exception:
+        return ""
+    return data.get("role", "")
+
+
+def validate_supabase_key(token):
+    role = jwt_role(token)
+    if role == "anon":
+        st.error("SUPABASE_KEY 当前是 anon key。请改用 service_role key，并只保存在 Streamlit Secrets。")
+        st.stop()
 
 
 def utc_now_iso():
@@ -145,8 +203,7 @@ def fetch_user_by_login(login):
     value = encode_filter_value(login.strip().lower())
     query = (
         f"?or=(email.eq.{value},username.eq.{value})"
-        "&select=user_id,username,email,password_hash,password_salt,plan,expire_at,"
-        "daily_limit,token_limit,is_admin,disabled,created_at"
+        "&select=*"
         "&limit=1"
     )
     rows = db_get("users", query)
@@ -157,7 +214,7 @@ def fetch_user_by_id(user_id):
     encoded_user_id = encode_filter_value(user_id)
     query = (
         f"?user_id=eq.{encoded_user_id}"
-        "&select=user_id,username,email,plan,expire_at,daily_limit,token_limit,is_admin,disabled,created_at"
+        "&select=*"
         "&limit=1"
     )
     rows = db_get("users", query)
@@ -171,42 +228,40 @@ def username_or_email_exists(username, email):
     return bool(rows)
 
 
+def user_plan_id(user):
+    return user.get("plan_id") or user.get("plan") or DEFAULT_PLAN_ID
+
+
 def get_plan(plan_id):
-    encoded_plan_id = encode_filter_value(plan_id or FREE_PLAN_ID)
+    encoded_plan_id = encode_filter_value(plan_id or DEFAULT_PLAN_ID)
     rows = db_get("plans", f"?plan_id=eq.{encoded_plan_id}&select=*&limit=1")
     if rows:
         return rows[0]
-    return {
-        "plan_id": FREE_PLAN_ID,
-        "name": "免费版",
-        "daily_limit": DEFAULT_DAILY_LIMIT,
-        "token_limit": DEFAULT_TOKEN_LIMIT,
-        "price": 0,
-        "billing_cycle": "free",
-    }
+    for plan in FALLBACK_PLANS:
+        if plan["plan_id"] == (plan_id or DEFAULT_PLAN_ID):
+            return plan
+    return FALLBACK_PLANS[0]
 
 
 def list_plans():
     rows = db_get("plans", "?select=*&order=price.asc")
     if rows:
         return rows
-    return [
-        {"plan_id": FREE_PLAN_ID, "name": "免费版", "daily_limit": 20, "token_limit": 50000, "price": 0, "billing_cycle": "free"},
-        {"plan_id": "monthly", "name": "月付版", "daily_limit": 200, "token_limit": 1000000, "price": 29, "billing_cycle": "month"},
-        {"plan_id": "yearly", "name": "年付版", "daily_limit": 500, "token_limit": 5000000, "price": 299, "billing_cycle": "year"},
-    ]
+    return FALLBACK_PLANS
 
 
 def effective_limits(user):
-    plan = get_plan(user.get("plan") or FREE_PLAN_ID)
+    plan = get_plan(user_plan_id(user))
     expire_at = parse_datetime(user.get("expire_at"))
     is_expired = bool(expire_at and expire_at < datetime.now(timezone.utc))
-    if user.get("plan") != FREE_PLAN_ID and is_expired:
-        plan = get_plan(FREE_PLAN_ID)
+    if user_plan_id(user) != FREE_PLAN_ID and is_expired:
+        plan = get_plan(DEFAULT_PLAN_ID)
 
     daily_limit = user.get("daily_limit") or plan.get("daily_limit") or DEFAULT_DAILY_LIMIT
     token_limit = user.get("token_limit") or plan.get("token_limit") or DEFAULT_TOKEN_LIMIT
-    return plan, int(daily_limit), int(token_limit), is_expired
+    monthly_limit = user.get("monthly_limit") or plan.get("monthly_limit") or DEFAULT_MONTHLY_LIMIT
+    monthly_token_limit = user.get("monthly_token_limit") or plan.get("monthly_token_limit") or DEFAULT_MONTHLY_TOKEN_LIMIT
+    return plan, int(daily_limit), int(token_limit), int(monthly_limit), int(monthly_token_limit), is_expired
 
 
 def create_user(username, email, password):
@@ -230,10 +285,13 @@ def create_user(username, email, password):
         "email": email,
         "password_hash": digest_hex,
         "password_salt": salt_hex,
-        "plan": FREE_PLAN_ID,
+        "plan": DEFAULT_PLAN_ID,
+        "plan_id": DEFAULT_PLAN_ID,
         "expire_at": None,
         "daily_limit": free_plan.get("daily_limit", DEFAULT_DAILY_LIMIT),
         "token_limit": free_plan.get("token_limit", DEFAULT_TOKEN_LIMIT),
+        "monthly_limit": free_plan.get("monthly_limit", DEFAULT_MONTHLY_LIMIT),
+        "monthly_token_limit": free_plan.get("monthly_token_limit", DEFAULT_MONTHLY_TOKEN_LIMIT),
         "is_admin": False,
         "disabled": False,
         "created_at": utc_now_iso(),
@@ -448,20 +506,35 @@ def get_search_context(query, enabled):
 def load_today_usage(user_id):
     encoded_user_id = encode_filter_value(user_id)
     today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    return load_usage_since(encoded_user_id, today_start)
+
+
+def load_month_usage(user_id):
+    encoded_user_id = encode_filter_value(user_id)
+    month_start = datetime.now(timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
+    return load_usage_since(encoded_user_id, month_start)
+
+
+def load_usage_since(encoded_user_id, start_time):
     rows = db_get(
         "usage_logs",
-        f"?user_id=eq.{encoded_user_id}&created_at=gte.{quote(today_start, safe=':-.')}&select=total_tokens",
+        f"?user_id=eq.{encoded_user_id}&created_at=gte.{quote(start_time, safe=':-.')}&select=total_tokens",
     )
     return len(rows), sum(int(row.get("total_tokens") or 0) for row in rows)
 
 
 def can_use_ai(user):
-    _, daily_limit, token_limit, _ = effective_limits(user)
+    _, daily_limit, token_limit, monthly_limit, monthly_token_limit, _ = effective_limits(user)
     calls_today, tokens_today = load_today_usage(user["user_id"])
+    calls_month, tokens_month = load_month_usage(user["user_id"])
     if calls_today >= daily_limit:
         return False, f"今日使用次数已达上限：{daily_limit} 次"
     if tokens_today >= token_limit:
         return False, f"今日 token 已达上限：{token_limit}"
+    if calls_month >= monthly_limit:
+        return False, f"本月使用次数已达上限：{monthly_limit} 次"
+    if tokens_month >= monthly_token_limit:
+        return False, f"本月 token 已达上限：{monthly_token_limit}"
     return True, ""
 
 
@@ -483,17 +556,37 @@ def record_usage(user_id, model, usage):
     )
 
 
+def create_payment_placeholder(user_id, plan, method):
+    plan_id = plan.get("plan_id") or DEFAULT_PLAN_ID
+    amount = float(plan.get("price") or 0)
+    payment = {
+        "user_id": user_id,
+        "plan_id": plan_id,
+        "amount": amount,
+        "status": "pending",
+        "method": method,
+        "created_at": utc_now_iso(),
+    }
+    return bool(db_insert("payments", payment))
+
+
 def render_upgrade_panel(user):
     st.subheader("开通会员 / 升级套餐")
-    st.caption("支付接口已预留，后续可接入 Stripe、支付宝、微信支付。支付密钥请放在 Streamlit Secrets。")
+    gateway_url = get_secret("PAYMENT_GATEWAY_URL", "https://example.com/pay")
+    st.caption("支付接口已预留，后续可接入支付宝、微信支付或真实支付网关。支付密钥请放在 Streamlit Secrets。")
     for plan in list_plans():
         with st.container(border=True):
             st.write(f"**{plan.get('name', plan.get('plan_id'))}**")
             st.write(f"每日次数：{plan.get('daily_limit')} ｜ 每日 tokens：{plan.get('token_limit')}")
+            st.write(f"每月次数：{plan.get('monthly_limit')} ｜ 每月 tokens：{plan.get('monthly_token_limit')}")
             st.write(f"价格：{plan.get('price', 0)} / {plan.get('billing_cycle', 'free')}")
-            if st.button(f"选择 {plan.get('name', plan.get('plan_id'))}", key=f"choose_plan_{plan.get('plan_id')}"):
-                provider = get_secret("PAYMENT_PROVIDER", "未配置")
-                st.info(f"支付占位：将创建 {provider} 支付订单，套餐为 {plan.get('name')}。当前未接入真实支付。")
+            cols = st.columns(2)
+            if cols[0].button("支付宝开通", key=f"alipay_{plan.get('plan_id')}"):
+                if create_payment_placeholder(user["user_id"], plan, "alipay"):
+                    st.info(f"已创建支付宝支付占位订单。未来可跳转到：{gateway_url}?method=alipay&plan_id={plan.get('plan_id')}")
+            if cols[1].button("微信支付开通", key=f"wechat_{plan.get('plan_id')}"):
+                if create_payment_placeholder(user["user_id"], plan, "wechat"):
+                    st.info(f"已创建微信支付占位订单。未来可跳转到：{gateway_url}?method=wechat&plan_id={plan.get('plan_id')}")
 
 
 def render_memory_manager(user_id):
@@ -516,8 +609,10 @@ def render_memory_manager(user_id):
 
 
 def render_sidebar(user):
-    plan, daily_limit, token_limit, is_expired = effective_limits(user)
+    plan, daily_limit, token_limit, monthly_limit, monthly_token_limit, is_expired = effective_limits(user)
     calls_today, tokens_today = load_today_usage(user["user_id"])
+    calls_month, tokens_month = load_month_usage(user["user_id"])
+    remaining_tokens_today = max(token_limit - tokens_today, 0)
     st.sidebar.title("毛毛AI")
     st.sidebar.caption(f"当前用户：{user.get('username') or user.get('email')}")
     st.sidebar.caption(f"套餐：{plan.get('name', user.get('plan'))}")
@@ -525,7 +620,8 @@ def render_sidebar(user):
         st.sidebar.warning("套餐已过期，已按免费版限制使用")
     metric_cols = st.sidebar.columns(2)
     metric_cols[0].metric("今日次数", f"{calls_today}/{daily_limit}")
-    metric_cols[1].metric("今日 Tokens", f"{tokens_today}/{token_limit}")
+    metric_cols[1].metric("剩余 Tokens", remaining_tokens_today)
+    st.sidebar.caption(f"本月次数：{calls_month}/{monthly_limit} ｜ 本月 Tokens：{tokens_month}/{monthly_token_limit}")
     model_name = st.sidebar.selectbox("模型", MODEL_OPTIONS, index=0)
     search_enabled = st.sidebar.toggle("启用联网搜索", value=st.session_state.get("search_enabled", False))
     st.session_state.search_enabled = search_enabled
@@ -547,12 +643,13 @@ def render_sidebar(user):
 def list_users_for_admin():
     return db_get(
         "users",
-        "?select=user_id,username,email,plan,expire_at,daily_limit,token_limit,is_admin,disabled,created_at&order=created_at.desc",
+        "?select=*&order=created_at.desc",
     )
 
 
 def update_user_plan(user_id, plan_id, daily_limit, token_limit, expire_at):
     data = {
+        "plan_id": plan_id,
         "plan": plan_id,
         "daily_limit": int(daily_limit),
         "token_limit": int(token_limit),
@@ -571,14 +668,19 @@ def render_admin_panel():
     plan_ids = [plan["plan_id"] for plan in plans]
     for user in users:
         calls_today, tokens_today = load_today_usage(user["user_id"])
+        calls_month, tokens_month = load_month_usage(user["user_id"])
         with st.expander(f"{user.get('username')} / {user.get('email')}"):
             st.write(f"user_id：`{user['user_id']}`")
             st.write(f"今日次数：{calls_today} ｜ 今日 tokens：{tokens_today}")
+            st.write(f"本月次数：{calls_month} ｜ 本月 tokens：{tokens_month}")
             disabled = st.checkbox("禁用用户", value=bool(user.get("disabled")), key=f"disabled_{user['user_id']}")
             is_admin = st.checkbox("管理员", value=bool(user.get("is_admin")), key=f"admin_{user['user_id']}")
-            plan_id = st.selectbox("套餐", plan_ids, index=plan_ids.index(user.get("plan")) if user.get("plan") in plan_ids else 0, key=f"plan_{user['user_id']}")
+            current_plan_id = user_plan_id(user)
+            plan_id = st.selectbox("套餐", plan_ids, index=plan_ids.index(current_plan_id) if current_plan_id in plan_ids else 0, key=f"plan_{user['user_id']}")
             daily_limit = st.number_input("每日次数限制", value=int(user.get("daily_limit") or DEFAULT_DAILY_LIMIT), min_value=0, key=f"daily_{user['user_id']}")
             token_limit = st.number_input("每日 token 限制", value=int(user.get("token_limit") or DEFAULT_TOKEN_LIMIT), min_value=0, key=f"token_{user['user_id']}")
+            monthly_limit = st.number_input("每月次数限制", value=int(user.get("monthly_limit") or DEFAULT_MONTHLY_LIMIT), min_value=0, key=f"monthly_{user['user_id']}")
+            monthly_token_limit = st.number_input("每月 token 限制", value=int(user.get("monthly_token_limit") or DEFAULT_MONTHLY_TOKEN_LIMIT), min_value=0, key=f"monthly_token_{user['user_id']}")
             expire_at = st.text_input("到期时间 ISO，可留空", value=user.get("expire_at") or "", key=f"expire_{user['user_id']}")
             cols = st.columns(3)
             if cols[0].button("保存用户", key=f"save_user_{user['user_id']}"):
@@ -588,9 +690,12 @@ def render_admin_panel():
                     {
                         "disabled": disabled,
                         "is_admin": is_admin,
+                        "plan_id": plan_id,
                         "plan": plan_id,
                         "daily_limit": int(daily_limit),
                         "token_limit": int(token_limit),
+                        "monthly_limit": int(monthly_limit),
+                        "monthly_token_limit": int(monthly_token_limit),
                         "expire_at": expire_at or None,
                     },
                 )
@@ -609,9 +714,11 @@ def append_and_save_message(user_id, role, content, saved_content=None):
 
 st.set_page_config(page_title="毛毛AI", page_icon="🤖", layout="wide")
 
+APP_SECRET = require_secret("APP_SECRET")
 OPENAI_API_KEY = require_secret("OPENAI_API_KEY")
 SUPABASE_URL = normalize_supabase_url(require_secret("SUPABASE_URL"))
 SUPABASE_KEY = require_secret("SUPABASE_KEY")
+validate_supabase_key(SUPABASE_KEY)
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 current_user = require_login()
@@ -709,11 +816,14 @@ with admin_tab:
         render_admin_panel()
     else:
         st.subheader("账号信息")
-        plan, daily_limit, token_limit, is_expired = effective_limits(current_user)
+        plan, daily_limit, token_limit, monthly_limit, monthly_token_limit, is_expired = effective_limits(current_user)
+        calls_today, tokens_today = load_today_usage(current_user_id)
         st.write(f"用户名：{current_user.get('username')}")
         st.write(f"邮箱：{current_user.get('email')}")
         st.write(f"套餐：{plan.get('name')}")
-        st.write(f"每日次数：{daily_limit}")
-        st.write(f"每日 tokens：{token_limit}")
+        st.write(f"今日次数：{calls_today}/{daily_limit}")
+        st.write(f"今日剩余 tokens：{max(token_limit - tokens_today, 0)}")
+        st.write(f"每月次数上限：{monthly_limit}")
+        st.write(f"每月 tokens 上限：{monthly_token_limit}")
         if is_expired:
             st.warning("套餐已过期")
