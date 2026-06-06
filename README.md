@@ -1,51 +1,58 @@
-# 毛毛AI Streamlit 助手
+# 毛毛AI 最终商业版
 
-毛毛AI 是一个基于 Streamlit、OpenAI 和 Supabase 的多用户 AI 助手，支持注册登录、长期记忆、图片分析、套餐额度、Token 统计、支付接口预留和管理后台。
+毛毛AI 是一个基于 Streamlit、OpenAI 和 Supabase 的个人 AI 商业化项目。当前版本包含 ChatGPT 式首页、多会话、邮箱验证码注册、找回密码、会员套餐、邀请码、推广返佣、二维码支付、长期记忆、图片分析、Token 统计和管理员后台。
 
-## 核心功能
+## 功能
 
-- 用户注册 / 登录：用户名、邮箱、密码
-- 密码哈希加密保存：不保存明文密码
-- 每个用户独立 `user_id`
-- 每个用户独立 `chat_history`、`memories`、`usage_logs`
-- 模型选择：`gpt-5` / `gpt-5.5` / `gpt-5-mini`
-- 图片上传后自动分析
-- 输入 `记住xxx` 自动写入长期记忆
-- 输入 `忘记xxx` 自动删除相关长期记忆
-- 套餐系统：免费版、月卡、季卡、年卡
-- 每日 / 每月使用次数限制
-- 每日 / 每月 Token 限制
-- `usage_logs` 记录每次 GPT 调用的 token 消耗
-- 支付接口预留：支付宝、微信支付按钮占位
-- 管理后台：用户管理、套餐管理、订单管理、数据统计
+- GPT 聊天，支持 Markdown 和代码块
+- 图片上传分析，并可在后续问题中继续带上最近图片
+- 左侧会话栏：新建对话、历史会话、重命名、删除、清空
+- 多用户注册/登录，密码哈希存储
+- 邮箱验证码注册，找回密码/重置密码
+- 长期记忆 `memories`
+- 聊天记录 `chat_history`
+- 会话表 `conversations`
+- 会员套餐：免费版、月付版、年付版
+- Token 和次数限制
+- 二维码收款：支付宝 / 微信
+- 用户上传付款截图
+- 管理员审核订单后一键开通会员
+- 邀请码和推广码
+- 推广返佣，佣金状态：`pending` / `paid` / `cancelled`
+- 管理后台：用户、订单、邀请码、返佣、套餐、统计
+
+不会显示 ChatGPT 名称、Logo 或 OpenAI 商标。
 
 ## Streamlit Secrets
 
 在 Streamlit Cloud 的 Secrets 中配置：
 
 ```toml
-APP_SECRET = "请填写一个随机长字符串"
 OPENAI_API_KEY = "你的 OpenAI API Key"
 SUPABASE_URL = "https://你的项目.supabase.co"
 SUPABASE_KEY = "你的 Supabase service_role key"
 SUPABASE_SCHEMA = "public"
+APP_SECRET = "请填写随机长字符串"
+APP_PASSWORD = "可选，兼容旧部署"
 
-# 可选：未来接入真实支付网关时替换
-PAYMENT_GATEWAY_URL = "https://example.com/pay"
-ALIPAY_APP_ID = ""
-WECHAT_PAY_MCH_ID = ""
+ALIPAY_QR_IMAGE_URL = "https://example.com/alipay-qr.png"
+WECHAT_QR_IMAGE_URL = "https://example.com/wechat-qr.png"
+
+# 可选：接入 Resend 后用于发送邮箱验证码
+RESEND_API_KEY = ""
+EMAIL_FROM = ""
 ```
 
 安全要求：
 
 - `SUPABASE_KEY` 必须使用 `service_role key`，不要使用 anon key
-- `service_role key` 只放在 Streamlit Secrets，不要写进 GitHub
-- `SUPABASE_URL` 填项目根地址，例如 `https://xxxx.supabase.co`
-- 不要在页面上显示完整密钥
+- 所有密钥只放在 Streamlit Secrets，不要写进代码
+- 页面不会显示完整密钥
+- 如果 `RESEND_API_KEY` 或 `EMAIL_FROM` 未配置，注册/找回密码会显示“邮箱接口暂未接入”的占位提示，并在页面显示临时验证码，方便测试
 
 ## Supabase SQL
 
-在 Supabase SQL Editor 中执行下面脚本。它可以重复执行，会自动补齐旧表缺失字段。
+在 Supabase SQL Editor 执行下面 SQL。脚本可重复执行，会补齐旧表字段。
 
 ```sql
 create extension if not exists pgcrypto;
@@ -64,6 +71,8 @@ create table if not exists public.users (
   token_limit integer default 50000,
   monthly_limit integer default 300,
   monthly_token_limit integer default 1000000,
+  referral_code text,
+  invited_by text,
   is_admin boolean default false,
   disabled boolean default false,
   created_at timestamptz default now()
@@ -81,37 +90,16 @@ alter table public.users add column if not exists daily_limit integer default 20
 alter table public.users add column if not exists token_limit integer default 50000;
 alter table public.users add column if not exists monthly_limit integer default 300;
 alter table public.users add column if not exists monthly_token_limit integer default 1000000;
+alter table public.users add column if not exists referral_code text;
+alter table public.users add column if not exists invited_by text;
 alter table public.users add column if not exists is_admin boolean default false;
 alter table public.users add column if not exists disabled boolean default false;
 alter table public.users add column if not exists created_at timestamptz default now();
 
-do $$
-begin
-  if exists (
-    select 1 from information_schema.columns
-    where table_schema = 'public' and table_name = 'users' and column_name = 'password'
-  ) then
-    alter table public.users alter column password drop not null;
-  end if;
-
-  if exists (
-    select 1 from information_schema.columns
-    where table_schema = 'public' and table_name = 'users' and column_name = 'plan_id' and data_type <> 'text'
-  ) then
-    alter table public.users alter column plan_id type text using plan_id::text;
-  end if;
-
-  if exists (
-    select 1 from information_schema.columns
-    where table_schema = 'public' and table_name = 'users' and column_name = 'plan' and data_type <> 'text'
-  ) then
-    alter table public.users alter column plan type text using plan::text;
-  end if;
-end $$;
-
 update public.users set user_id = gen_random_uuid()::text where user_id is null;
 update public.users set plan_id = coalesce(nullif(plan_id, ''), nullif(plan, ''), 'free');
 update public.users set plan = coalesce(nullif(plan, ''), plan_id, 'free');
+update public.users set referral_code = lower(substr(regexp_replace(coalesce(username, 'user'), '[^a-zA-Z0-9]', '', 'g'), 1, 8) || substr(replace(gen_random_uuid()::text, '-', ''), 1, 6)) where referral_code is null;
 update public.users set daily_limit = coalesce(daily_limit, 20);
 update public.users set token_limit = coalesce(token_limit, 50000);
 update public.users set monthly_limit = coalesce(monthly_limit, 300);
@@ -122,6 +110,8 @@ update public.users set disabled = coalesce(disabled, false);
 create unique index if not exists users_user_id_unique on public.users (user_id);
 create unique index if not exists users_username_unique on public.users (username);
 create unique index if not exists users_email_unique on public.users (email);
+create unique index if not exists users_referral_code_unique on public.users (referral_code);
+create index if not exists users_created_at_idx on public.users (created_at desc);
 
 create table if not exists public.plans (
   id bigint generated always as identity primary key,
@@ -146,35 +136,15 @@ alter table public.plans add column if not exists monthly_limit integer default 
 alter table public.plans add column if not exists monthly_token_limit integer default 1000000;
 alter table public.plans add column if not exists description text;
 alter table public.plans add column if not exists created_at timestamptz default now();
-
-do $$
-begin
-  if exists (
-    select 1 from information_schema.columns
-    where table_schema = 'public' and table_name = 'plans' and column_name = 'plan_id' and data_type <> 'text'
-  ) then
-    alter table public.plans alter column plan_id type text using plan_id::text;
-  end if;
-end $$;
-
 create unique index if not exists plans_plan_id_unique on public.plans (plan_id);
-
-update public.users set plan_id = 'monthly', plan = 'monthly' where plan_id = 'basic' or plan = 'basic';
-update public.users set plan_id = 'yearly', plan = 'yearly' where plan_id = 'pro' or plan = 'pro';
-update public.payments set plan_id = 'monthly' where plan_id = 'basic';
-update public.payments set plan_id = 'yearly' where plan_id = 'pro';
-delete from public.plans where plan_id is null;
-delete from public.plans where plan_id in ('basic', 'pro');
 
 insert into public.plans (
   plan_id, name, price, billing_cycle,
   daily_limit, token_limit, monthly_limit, monthly_token_limit, description
-)
-values
-  ('free', '免费版', 0, 'free', 20, 50000, 300, 1000000, '适合试用，每日和每月额度较低。'),
-  ('monthly', '月卡', 29, 'monthly', 300, 1000000, 6000, 20000000, '适合日常高频使用，按月开通。'),
-  ('quarterly', '季卡', 79, 'quarterly', 600, 2500000, 15000, 60000000, '适合稳定使用，季度套餐更省心。'),
-  ('yearly', '年卡', 299, 'yearly', 1200, 6000000, 50000, 200000000, '适合长期使用和商业场景。')
+) values
+  ('free', '免费版', 0, 'free', 20, 50000, 300, 1000000, '适合试用，含基础聊天、图片分析和长期记忆。'),
+  ('monthly', '月付版', 29, 'monthly', 300, 1000000, 6000, 20000000, '适合日常高频使用，人工审核开通。'),
+  ('yearly', '年付版', 299, 'yearly', 1200, 6000000, 50000, 200000000, '适合长期使用和商业场景，额度更高。')
 on conflict (plan_id) do update set
   name = excluded.name,
   price = excluded.price,
@@ -185,54 +155,26 @@ on conflict (plan_id) do update set
   monthly_token_limit = excluded.monthly_token_limit,
   description = excluded.description;
 
-create table if not exists public.payments (
+create table if not exists public.conversations (
   id bigint generated always as identity primary key,
   user_id text not null,
-  plan_id text not null,
-  amount numeric(10, 2) default 0,
-  status text default 'pending',
-  method text default 'placeholder',
-  created_at timestamptz default now()
+  title text default '新对话',
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
 );
-
-alter table public.payments add column if not exists user_id text;
-alter table public.payments add column if not exists plan_id text;
-alter table public.payments add column if not exists amount numeric(10, 2) default 0;
-alter table public.payments add column if not exists status text default 'pending';
-alter table public.payments add column if not exists method text default 'placeholder';
-alter table public.payments add column if not exists created_at timestamptz default now();
-
-do $$
-begin
-  if exists (
-    select 1 from information_schema.columns
-    where table_schema = 'public' and table_name = 'payments' and column_name = 'plan_id' and data_type <> 'text'
-  ) then
-    alter table public.payments alter column plan_id type text using plan_id::text;
-  end if;
-
-  if exists (
-    select 1 from information_schema.columns
-    where table_schema = 'public' and table_name = 'payments' and column_name = 'plan'
-  ) then
-    alter table public.payments alter column plan drop not null;
-  end if;
-
-  if exists (
-    select 1 from information_schema.columns
-    where table_schema = 'public' and table_name = 'payments' and column_name = 'provider'
-  ) then
-    alter table public.payments alter column provider drop not null;
-  end if;
-end $$;
+create index if not exists conversations_user_updated_idx on public.conversations (user_id, updated_at desc);
 
 create table if not exists public.chat_history (
   id bigint generated always as identity primary key,
   user_id text not null,
+  conversation_id bigint,
   role text not null check (role in ('user', 'assistant')),
   content text not null,
   created_at timestamptz default now()
 );
+alter table public.chat_history add column if not exists conversation_id bigint;
+create index if not exists chat_history_user_conversation_idx on public.chat_history (user_id, conversation_id, id);
+create index if not exists chat_history_created_at_role_idx on public.chat_history (created_at desc, role);
 
 create table if not exists public.memories (
   id bigint generated always as identity primary key,
@@ -240,6 +182,7 @@ create table if not exists public.memories (
   memory text not null,
   created_at timestamptz default now()
 );
+create index if not exists memories_user_id_idx on public.memories (user_id, id);
 
 create table if not exists public.usage_logs (
   id bigint generated always as identity primary key,
@@ -250,11 +193,77 @@ create table if not exists public.usage_logs (
   total_tokens integer default 0,
   created_at timestamptz default now()
 );
+create index if not exists usage_logs_user_created_idx on public.usage_logs (user_id, created_at desc);
+create index if not exists usage_logs_created_at_idx on public.usage_logs (created_at desc);
 
-create index if not exists chat_history_user_id_id_idx on public.chat_history (user_id, id);
-create index if not exists memories_user_id_id_idx on public.memories (user_id, id);
-create index if not exists usage_logs_user_id_created_at_idx on public.usage_logs (user_id, created_at desc);
-create index if not exists payments_user_id_created_at_idx on public.payments (user_id, created_at desc);
+create table if not exists public.payments (
+  id bigint generated always as identity primary key,
+  user_id text not null,
+  plan_id text not null,
+  amount numeric(10, 2) default 0,
+  status text default 'pending',
+  screenshot_base64 text,
+  created_at timestamptz default now()
+);
+alter table public.payments add column if not exists screenshot_base64 text;
+alter table public.payments add column if not exists status text default 'pending';
+alter table public.payments add column if not exists created_at timestamptz default now();
+create index if not exists payments_user_created_idx on public.payments (user_id, created_at desc);
+create index if not exists payments_status_created_idx on public.payments (status, created_at desc);
+
+create table if not exists public.email_codes (
+  id bigint generated always as identity primary key,
+  email text not null,
+  purpose text not null,
+  code_hash text not null,
+  used boolean default false,
+  expires_at timestamptz,
+  created_at timestamptz default now()
+);
+create index if not exists email_codes_email_purpose_idx on public.email_codes (email, purpose, used, created_at desc);
+
+create table if not exists public.password_resets (
+  id bigint generated always as identity primary key,
+  email text not null,
+  token_hash text not null,
+  used boolean default false,
+  expires_at timestamptz,
+  created_at timestamptz default now()
+);
+create index if not exists password_resets_email_idx on public.password_resets (email, used, created_at desc);
+
+create table if not exists public.invite_codes (
+  id bigint generated always as identity primary key,
+  code text unique not null,
+  max_uses integer default 1,
+  used_count integer default 0,
+  promoter_user_id text,
+  disabled boolean default false,
+  created_at timestamptz default now()
+);
+create index if not exists invite_codes_code_idx on public.invite_codes (code);
+
+create table if not exists public.referrals (
+  id bigint generated always as identity primary key,
+  referrer_user_id text not null,
+  referred_user_id text not null,
+  invite_code text,
+  created_at timestamptz default now()
+);
+create unique index if not exists referrals_referred_unique on public.referrals (referred_user_id);
+create index if not exists referrals_referrer_idx on public.referrals (referrer_user_id);
+
+create table if not exists public.commissions (
+  id bigint generated always as identity primary key,
+  payment_id bigint,
+  referrer_user_id text not null,
+  referred_user_id text not null,
+  amount numeric(10, 2) default 0,
+  status text default 'pending',
+  created_at timestamptz default now()
+);
+create index if not exists commissions_referrer_idx on public.commissions (referrer_user_id, status, created_at desc);
+create index if not exists commissions_payment_idx on public.commissions (payment_id);
 
 grant usage on schema public to service_role;
 grant all privileges on all tables in schema public to service_role;
@@ -263,16 +272,22 @@ grant all privileges on all sequences in schema public to service_role;
 alter table public.users disable row level security;
 alter table public.plans disable row level security;
 alter table public.payments disable row level security;
+alter table public.conversations disable row level security;
 alter table public.chat_history disable row level security;
 alter table public.memories disable row level security;
 alter table public.usage_logs disable row level security;
+alter table public.email_codes disable row level security;
+alter table public.password_resets disable row level security;
+alter table public.invite_codes disable row level security;
+alter table public.referrals disable row level security;
+alter table public.commissions disable row level security;
 
 notify pgrst, 'reload schema';
 ```
 
 ## 首个管理员
 
-先注册一个普通账号，然后在 Supabase SQL Editor 中执行：
+先注册一个普通账号，然后执行：
 
 ```sql
 update public.users
@@ -282,45 +297,43 @@ where email = '你的邮箱@example.com';
 
 重新登录后会看到“管理后台”。
 
-## 管理后台
+## 支付流程
 
-管理员登录后会看到“管理后台”标签页，普通用户只能看到账号信息，不能进入后台。
+1. 用户进入“会员/支付”
+2. 选择免费版、月付版或年付版
+3. 系统写入 `payments`，状态为 `pending`
+4. 页面展示支付宝和微信二维码
+5. 用户上传付款截图
+6. 管理员在后台审核通过
+7. 系统自动开通会员，并按推广关系生成 `commissions`
 
-后台包含：
+后续接入支付宝官方 API 或微信支付 API 时，可以用真实支付回调更新 `payments.status = 'paid'`，然后调用同样的开通会员逻辑。
 
-- 用户管理：查看所有用户、搜索用户、修改套餐、修改每日次数、修改 Token 额度、封禁用户、删除用户、清空用户聊天记录
-- 套餐管理：维护免费版、月卡、季卡、年卡，支持修改价格、计费周期、每日 / 每月次数和 Token 额度
-- 订单管理：查看支付订单、支付状态、用户购买记录，并可手动更新订单状态
-- 数据统计：今日新增用户、今日聊天次数、今日 Token 消耗、总收入
+## 邮箱验证
 
-## 支付接口预留
+如果配置了：
 
-当前 `app.py` 会在点击“支付宝开通”或“微信支付开通”时向 `payments` 表写入一条 `pending` 记录：
+- `RESEND_API_KEY`
+- `EMAIL_FROM`
 
-- `user_id`
-- `plan_id`
-- `amount`
-- `status`
-- `method`
-- `created_at`
+系统会通过 Resend 发送邮箱验证码。未配置时，页面会显示占位提示和临时验证码，仅用于测试。
 
-未来接入真实支付时，把 `PAYMENT_GATEWAY_URL` 替换为真实网关地址，并在支付回调中把 `payments.status` 更新为 `paid`，再更新用户的 `plan_id`、`daily_limit`、`token_limit`、`monthly_limit`、`monthly_token_limit`。
+## 部署检查
 
-## 部署前测试步骤
-
-1. 在 Supabase SQL Editor 执行上面的完整 SQL。
-2. 在 Streamlit Secrets 配置 `APP_SECRET`、`OPENAI_API_KEY`、`SUPABASE_URL`、`SUPABASE_KEY`、`SUPABASE_SCHEMA`。
-3. 确认 `SUPABASE_KEY` 是 `service_role key`，不是 anon key。
-4. 重启 Streamlit Cloud 应用。
-5. 注册一个新用户，确认 `users` 表新增记录，且 `plan_id = 'free'`。
-6. 登录该用户，发送一条聊天消息，确认 `chat_history` 和 `usage_logs` 写入。
-7. 输入 `记住我喜欢简洁回答`，确认 `memories` 写入。
-8. 刷新页面，确认聊天记录和长期记忆仍正常显示。
-9. 上传一张图片，确认会自动触发图片分析。
-10. 将该用户设置为管理员，重新登录后进入管理后台，测试用户管理、套餐管理、订单管理和数据统计。
+1. 执行 Supabase SQL
+2. 配置 Streamlit Secrets
+3. 重启 Streamlit Cloud
+4. 注册新用户，验证邮箱验证码
+5. 创建会话并发送消息
+6. 输入 `记住我喜欢简洁回答`，确认长期记忆写入
+7. 上传图片并追问
+8. 购买套餐，上传付款截图
+9. 管理员审核订单并开通会员
+10. 测试邀请码和推广返佣
 
 ## 常见问题
 
-- `SUPABASE_KEY 当前是 anon key`：请在 Streamlit Secrets 改为 service_role key。
-- `读取 users 失败：404`：确认表在 `public` schema 下，并执行 `notify pgrst, 'reload schema';`。
-- 支付按钮只写入 pending 记录：这是预留接口，当前不会真实扣款。
+- `SUPABASE_KEY 当前是 anon key`：请改为 service_role key。
+- `读取 users 失败：404`：确认表在 public schema，并执行 `notify pgrst, 'reload schema';`。
+- 邮箱收不到验证码：确认 `RESEND_API_KEY` 和 `EMAIL_FROM`，或先使用占位验证码测试。
+- 支付不会自动到账：当前是二维码人工审核版，真实支付 API 接入位置已保留。
