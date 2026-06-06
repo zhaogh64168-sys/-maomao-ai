@@ -29,6 +29,7 @@
 OPENAI_API_KEY = "你的 OpenAI API Key"
 SUPABASE_URL = "https://你的项目.supabase.co"
 SUPABASE_KEY = "你的 Supabase anon key 或 service role key"
+SUPABASE_SCHEMA = "public"
 
 # 可选：支付接口占位配置，当前不会发起真实扣款
 PAYMENT_PROVIDER = "placeholder"
@@ -42,7 +43,10 @@ WECHAT_PAY_MCH_ID = ""
 - 不要把任何 API Key 写进代码
 - 不要把完整密钥显示在页面上
 - Streamlit Secrets 只在服务端读取
-- 如果启用 RLS，请确保策略和你的 Supabase Key 匹配
+- `SUPABASE_URL` 推荐填写项目根地址，例如 `https://xxxx.supabase.co`，不要填写 `https://xxxx.supabase.co/rest/v1`
+- 如果你填写了带 `/rest/v1` 的地址，当前代码会自动纠正
+- 这个项目使用自建账号系统，推荐 `SUPABASE_KEY` 使用 `service_role key`，只放在 Streamlit Secrets，不要放到前端页面或公开仓库
+- 如果启用 RLS，请确保策略和你的 Supabase Key 匹配；使用 `service_role key` 时通常可以直接绕过 RLS
 
 ## 首个管理员
 
@@ -157,6 +161,19 @@ create table if not exists public.usage_logs (
 
 create index if not exists usage_logs_user_id_created_at_idx
   on public.usage_logs (user_id, created_at desc);
+
+grant usage on schema public to anon, authenticated, service_role;
+grant all privileges on all tables in schema public to service_role;
+grant all privileges on all sequences in schema public to service_role;
+
+grant select, insert, update, delete on public.users to service_role;
+grant select, insert, update, delete on public.plans to service_role;
+grant select, insert, update, delete on public.payments to service_role;
+grant select, insert, update, delete on public.chat_history to service_role;
+grant select, insert, update, delete on public.memories to service_role;
+grant select, insert, update, delete on public.usage_logs to service_role;
+
+notify pgrst, 'reload schema';
 ```
 
 如果这是一个由 Streamlit 后端统一访问 Supabase 的项目，可以先关闭 RLS：
@@ -170,7 +187,99 @@ alter table public.memories disable row level security;
 alter table public.usage_logs disable row level security;
 ```
 
-如果你要开启 RLS，请为这些表配置严格策略。普通用户不能读取别人的聊天记录、长期记忆和使用日志；管理员权限应只通过 `users.is_admin` 判断。
+如果你要开启 RLS，并且 `SUPABASE_KEY` 使用的是 `service_role key`，可以使用下面的策略。`service_role` 仍然只应该放在 Streamlit Secrets 中：
+
+```sql
+alter table public.users enable row level security;
+alter table public.plans enable row level security;
+alter table public.payments enable row level security;
+alter table public.chat_history enable row level security;
+alter table public.memories enable row level security;
+alter table public.usage_logs enable row level security;
+
+drop policy if exists "service_role_all_users" on public.users;
+create policy "service_role_all_users"
+on public.users
+for all
+to service_role
+using (true)
+with check (true);
+
+drop policy if exists "service_role_all_plans" on public.plans;
+create policy "service_role_all_plans"
+on public.plans
+for all
+to service_role
+using (true)
+with check (true);
+
+drop policy if exists "service_role_all_payments" on public.payments;
+create policy "service_role_all_payments"
+on public.payments
+for all
+to service_role
+using (true)
+with check (true);
+
+drop policy if exists "service_role_all_chat_history" on public.chat_history;
+create policy "service_role_all_chat_history"
+on public.chat_history
+for all
+to service_role
+using (true)
+with check (true);
+
+drop policy if exists "service_role_all_memories" on public.memories;
+create policy "service_role_all_memories"
+on public.memories
+for all
+to service_role
+using (true)
+with check (true);
+
+drop policy if exists "service_role_all_usage_logs" on public.usage_logs;
+create policy "service_role_all_usage_logs"
+on public.usage_logs
+for all
+to service_role
+using (true)
+with check (true);
+
+notify pgrst, 'reload schema';
+```
+
+注意：这个项目的普通用户账号不是 Supabase Auth 用户，而是保存在 `public.users` 的自建账号。因此不要给 `anon` 写宽松的“全表读写”RLS 策略，否则普通用户可能通过 API 访问别人的数据。生产部署建议只让 Streamlit 服务端用 `service_role key` 访问 Supabase，应用代码用 `user_id` 做数据隔离。
+
+## 如果注册时报 404
+
+如果你已经执行 SQL 但页面仍显示：
+
+- `读取 users 失败：404`
+- `读取 plans 失败：404`
+- `写入 users 失败：404`
+
+请在 Supabase SQL Editor 再执行：
+
+```sql
+select table_schema, table_name
+from information_schema.tables
+where table_schema = 'public'
+  and table_name in ('users', 'plans', 'payments', 'chat_history', 'memories', 'usage_logs')
+order by table_name;
+
+notify pgrst, 'reload schema';
+```
+
+你应该看到 6 张表都在 `public` schema 下：
+
+- `users`
+- `plans`
+- `payments`
+- `chat_history`
+- `memories`
+- `usage_logs`
+
+如果查不到这些表，说明表没有建在 `public` schema，需要重新执行上面的完整建表 SQL。
 
 ## 表说明
 
