@@ -16,6 +16,7 @@ from openai import OpenAI
 MODEL_OPTIONS = ["gpt-5", "gpt-5.5", "gpt-5-mini"]
 FREE_PLAN_ID = "free"
 DEFAULT_PLAN_ID = FREE_PLAN_ID
+ADMIN_PLAN_IDS = ["free", "monthly", "quarterly", "yearly"]
 DEFAULT_DAILY_LIMIT = 20
 DEFAULT_TOKEN_LIMIT = 50000
 DEFAULT_MONTHLY_LIMIT = 300
@@ -35,26 +36,37 @@ FALLBACK_PLANS = [
         "description": "适合试用，每日和每月额度较低。",
     },
     {
-        "plan_id": "basic",
-        "name": "普通版",
+        "plan_id": "monthly",
+        "name": "月卡",
         "price": 29,
         "billing_cycle": "monthly",
         "daily_limit": 300,
         "token_limit": 1000000,
         "monthly_limit": 6000,
         "monthly_token_limit": 20000000,
-        "description": "适合日常高频使用。",
+        "description": "适合日常高频使用，按月开通。",
     },
     {
-        "plan_id": "pro",
-        "name": "高级版",
-        "price": 99,
-        "billing_cycle": "monthly",
-        "daily_limit": 1000,
-        "token_limit": 5000000,
-        "monthly_limit": 30000,
-        "monthly_token_limit": 100000000,
-        "description": "适合重度使用和商业场景。",
+        "plan_id": "quarterly",
+        "name": "季卡",
+        "price": 79,
+        "billing_cycle": "quarterly",
+        "daily_limit": 600,
+        "token_limit": 2500000,
+        "monthly_limit": 15000,
+        "monthly_token_limit": 60000000,
+        "description": "适合稳定使用，季度套餐更省心。",
+    },
+    {
+        "plan_id": "yearly",
+        "name": "年卡",
+        "price": 299,
+        "billing_cycle": "yearly",
+        "daily_limit": 1200,
+        "token_limit": 6000000,
+        "monthly_limit": 50000,
+        "monthly_token_limit": 200000000,
+        "description": "适合长期使用和商业场景。",
     },
 ]
 
@@ -104,6 +116,14 @@ def validate_supabase_key(token):
 
 def utc_now_iso():
     return datetime.now(timezone.utc).isoformat()
+
+
+def today_start_iso():
+    return datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+
+
+def month_start_iso():
+    return datetime.now(timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
 
 
 def parse_datetime(value):
@@ -244,7 +264,8 @@ def get_plan(plan_id):
 
 
 def list_plans():
-    rows = db_get("plans", "?select=*&order=price.asc")
+    plan_filter = ",".join(ADMIN_PLAN_IDS)
+    rows = db_get("plans", f"?plan_id=in.({plan_filter})&select=*&order=price.asc")
     if rows:
         return rows
     return FALLBACK_PLANS
@@ -505,14 +526,12 @@ def get_search_context(query, enabled):
 
 def load_today_usage(user_id):
     encoded_user_id = encode_filter_value(user_id)
-    today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-    return load_usage_since(encoded_user_id, today_start)
+    return load_usage_since(encoded_user_id, today_start_iso())
 
 
 def load_month_usage(user_id):
     encoded_user_id = encode_filter_value(user_id)
-    month_start = datetime.now(timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
-    return load_usage_since(encoded_user_id, month_start)
+    return load_usage_since(encoded_user_id, month_start_iso())
 
 
 def load_usage_since(encoded_user_id, start_time):
@@ -647,46 +666,149 @@ def list_users_for_admin():
     )
 
 
-def update_user_plan(user_id, plan_id, daily_limit, token_limit, expire_at):
-    data = {
-        "plan_id": plan_id,
-        "plan": plan_id,
-        "daily_limit": int(daily_limit),
-        "token_limit": int(token_limit),
-        "expire_at": expire_at or None,
-    }
-    return db_patch("users", f"?user_id=eq.{encode_filter_value(user_id)}", data)
+def list_payments_for_admin():
+    return db_get("payments", "?select=*&order=created_at.desc")
 
 
-def render_admin_panel():
-    st.subheader("管理后台")
-    users = list_users_for_admin()
-    if not users:
-        st.caption("暂无用户")
-        return
-    plans = list_plans()
-    plan_ids = [plan["plan_id"] for plan in plans]
+def plan_name_map(plans):
+    return {plan.get("plan_id"): plan.get("name", plan.get("plan_id")) for plan in plans}
+
+
+def format_money(value):
+    try:
+        return f"¥{float(value or 0):,.2f}"
+    except (TypeError, ValueError):
+        return "¥0.00"
+
+
+def load_today_user_count():
+    rows = db_get("users", f"?created_at=gte.{quote(today_start_iso(), safe=':-.')}&select=id")
+    return len(rows)
+
+
+def load_today_chat_count():
+    rows = db_get(
+        "chat_history",
+        f"?role=eq.user&created_at=gte.{quote(today_start_iso(), safe=':-.')}&select=id",
+    )
+    return len(rows)
+
+
+def load_today_token_total():
+    rows = db_get(
+        "usage_logs",
+        f"?created_at=gte.{quote(today_start_iso(), safe=':-.')}&select=total_tokens",
+    )
+    return sum(int(row.get("total_tokens") or 0) for row in rows)
+
+
+def load_total_revenue():
+    rows = db_get("payments", "?status=eq.paid&select=amount")
+    total = 0.0
+    for row in rows:
+        try:
+            total += float(row.get("amount") or 0)
+        except (TypeError, ValueError):
+            pass
+    return total
+
+
+def delete_user_and_data(user_id):
+    encoded_user_id = encode_filter_value(user_id)
+    clear_messages(user_id)
+    clear_memories(user_id)
+    db_delete("usage_logs", f"?user_id=eq.{encoded_user_id}")
+    return db_delete("users", f"?user_id=eq.{encoded_user_id}")
+
+
+def update_plan_config(plan_id, data):
+    return db_patch("plans", f"?plan_id=eq.{encode_filter_value(plan_id)}", data)
+
+
+def update_payment_status(payment_id, status):
+    return db_patch("payments", f"?id=eq.{encode_filter_value(payment_id)}", {"status": status})
+
+
+def render_admin_user_management(users, plans):
+    st.markdown("#### 用户管理")
+    search = st.text_input("搜索用户", placeholder="输入用户名、邮箱或 user_id")
+    keyword = search.strip().lower()
+    if keyword:
+        users = [
+            user
+            for user in users
+            if keyword in str(user.get("username", "")).lower()
+            or keyword in str(user.get("email", "")).lower()
+            or keyword in str(user.get("user_id", "")).lower()
+        ]
+    st.caption(f"共 {len(users)} 个用户")
+
+    plan_ids = [plan.get("plan_id") for plan in plans if plan.get("plan_id")]
+    if not plan_ids:
+        plan_ids = ADMIN_PLAN_IDS
+    name_map = plan_name_map(plans)
+
     for user in users:
-        calls_today, tokens_today = load_today_usage(user["user_id"])
-        calls_month, tokens_month = load_month_usage(user["user_id"])
-        with st.expander(f"{user.get('username')} / {user.get('email')}"):
-            st.write(f"user_id：`{user['user_id']}`")
-            st.write(f"今日次数：{calls_today} ｜ 今日 tokens：{tokens_today}")
-            st.write(f"本月次数：{calls_month} ｜ 本月 tokens：{tokens_month}")
-            disabled = st.checkbox("禁用用户", value=bool(user.get("disabled")), key=f"disabled_{user['user_id']}")
-            is_admin = st.checkbox("管理员", value=bool(user.get("is_admin")), key=f"admin_{user['user_id']}")
+        user_id = user.get("user_id")
+        title = f"{user.get('username') or '未命名'} / {user.get('email') or '无邮箱'}"
+        with st.expander(title):
+            calls_today, tokens_today = load_today_usage(user_id)
+            calls_month, tokens_month = load_month_usage(user_id)
+            st.write(f"user_id：`{user_id}`")
+            st.write(f"今日使用：{calls_today} 次，{tokens_today} tokens")
+            st.write(f"本月使用：{calls_month} 次，{tokens_month} tokens")
+
             current_plan_id = user_plan_id(user)
-            plan_id = st.selectbox("套餐", plan_ids, index=plan_ids.index(current_plan_id) if current_plan_id in plan_ids else 0, key=f"plan_{user['user_id']}")
-            daily_limit = st.number_input("每日次数限制", value=int(user.get("daily_limit") or DEFAULT_DAILY_LIMIT), min_value=0, key=f"daily_{user['user_id']}")
-            token_limit = st.number_input("每日 token 限制", value=int(user.get("token_limit") or DEFAULT_TOKEN_LIMIT), min_value=0, key=f"token_{user['user_id']}")
-            monthly_limit = st.number_input("每月次数限制", value=int(user.get("monthly_limit") or DEFAULT_MONTHLY_LIMIT), min_value=0, key=f"monthly_{user['user_id']}")
-            monthly_token_limit = st.number_input("每月 token 限制", value=int(user.get("monthly_token_limit") or DEFAULT_MONTHLY_TOKEN_LIMIT), min_value=0, key=f"monthly_token_{user['user_id']}")
-            expire_at = st.text_input("到期时间 ISO，可留空", value=user.get("expire_at") or "", key=f"expire_{user['user_id']}")
-            cols = st.columns(3)
-            if cols[0].button("保存用户", key=f"save_user_{user['user_id']}"):
+            plan_index = plan_ids.index(current_plan_id) if current_plan_id in plan_ids else 0
+            plan_id = st.selectbox(
+                "套餐",
+                plan_ids,
+                index=plan_index,
+                format_func=lambda value: f"{name_map.get(value, value)} ({value})",
+                key=f"admin_plan_{user_id}",
+            )
+            col_a, col_b = st.columns(2)
+            daily_limit = col_a.number_input(
+                "每日次数",
+                value=int(user.get("daily_limit") or DEFAULT_DAILY_LIMIT),
+                min_value=0,
+                step=1,
+                key=f"admin_daily_{user_id}",
+            )
+            token_limit = col_b.number_input(
+                "每日 Token 额度",
+                value=int(user.get("token_limit") or DEFAULT_TOKEN_LIMIT),
+                min_value=0,
+                step=1000,
+                key=f"admin_token_{user_id}",
+            )
+            monthly_limit = col_a.number_input(
+                "每月次数",
+                value=int(user.get("monthly_limit") or DEFAULT_MONTHLY_LIMIT),
+                min_value=0,
+                step=10,
+                key=f"admin_monthly_{user_id}",
+            )
+            monthly_token_limit = col_b.number_input(
+                "每月 Token 额度",
+                value=int(user.get("monthly_token_limit") or DEFAULT_MONTHLY_TOKEN_LIMIT),
+                min_value=0,
+                step=10000,
+                key=f"admin_monthly_token_{user_id}",
+            )
+            expire_at = st.text_input(
+                "到期时间 ISO，可留空",
+                value=user.get("expire_at") or "",
+                key=f"admin_expire_{user_id}",
+            )
+            disabled = st.checkbox("封禁用户", value=bool(user.get("disabled")), key=f"admin_disabled_{user_id}")
+            is_admin = st.checkbox("管理员", value=bool(user.get("is_admin")), key=f"admin_is_admin_{user_id}")
+
+            save_col, clear_col, delete_col = st.columns(3)
+            if save_col.button("保存用户", key=f"admin_save_user_{user_id}"):
                 db_patch(
                     "users",
-                    f"?user_id=eq.{encode_filter_value(user['user_id'])}",
+                    f"?user_id=eq.{encode_filter_value(user_id)}",
                     {
                         "disabled": disabled,
                         "is_admin": is_admin,
@@ -700,9 +822,167 @@ def render_admin_panel():
                     },
                 )
                 st.rerun()
-            if cols[1].button("清空聊天", key=f"clear_user_chat_{user['user_id']}"):
-                clear_messages(user["user_id"])
+            if clear_col.button("清空聊天", key=f"admin_clear_chat_{user_id}"):
+                clear_messages(user_id)
                 st.rerun()
+
+            confirm_delete = st.checkbox("确认删除该用户", key=f"admin_confirm_delete_{user_id}")
+            is_current_admin = user_id == st.session_state.get("user_id")
+            if delete_col.button(
+                "删除用户",
+                key=f"admin_delete_user_{user_id}",
+                disabled=(not confirm_delete or is_current_admin),
+            ):
+                if delete_user_and_data(user_id):
+                    st.rerun()
+            if is_current_admin:
+                st.caption("当前登录管理员不能在这里删除自己。")
+
+
+def render_admin_plan_management(plans):
+    st.markdown("#### 套餐管理")
+    st.caption("后台可直接修改免费版、月卡、季卡、年卡的价格和额度。")
+    plan_map = {plan.get("plan_id"): plan for plan in plans}
+
+    for fallback in FALLBACK_PLANS:
+        plan_id = fallback["plan_id"]
+        plan = {**fallback, **plan_map.get(plan_id, {})}
+        with st.expander(f"{plan.get('name')} ({plan_id})", expanded=plan_id == FREE_PLAN_ID):
+            name = st.text_input("套餐名称", value=plan.get("name") or "", key=f"plan_name_{plan_id}")
+            billing_options = ["free", "monthly", "quarterly", "yearly"]
+            billing_value = plan.get("billing_cycle") or fallback["billing_cycle"]
+            billing_cycle = st.selectbox(
+                "计费周期",
+                billing_options,
+                index=billing_options.index(billing_value) if billing_value in billing_options else 0,
+                key=f"plan_cycle_{plan_id}",
+            )
+            price = st.number_input(
+                "价格",
+                value=float(plan.get("price") or 0),
+                min_value=0.0,
+                step=1.0,
+                key=f"plan_price_{plan_id}",
+            )
+            col_a, col_b = st.columns(2)
+            daily_limit = col_a.number_input(
+                "每日次数",
+                value=int(plan.get("daily_limit") or fallback["daily_limit"]),
+                min_value=0,
+                step=1,
+                key=f"plan_daily_{plan_id}",
+            )
+            token_limit = col_b.number_input(
+                "每日 Token 额度",
+                value=int(plan.get("token_limit") or fallback["token_limit"]),
+                min_value=0,
+                step=1000,
+                key=f"plan_token_{plan_id}",
+            )
+            monthly_limit = col_a.number_input(
+                "每月次数",
+                value=int(plan.get("monthly_limit") or fallback["monthly_limit"]),
+                min_value=0,
+                step=10,
+                key=f"plan_monthly_{plan_id}",
+            )
+            monthly_token_limit = col_b.number_input(
+                "每月 Token 额度",
+                value=int(plan.get("monthly_token_limit") or fallback["monthly_token_limit"]),
+                min_value=0,
+                step=10000,
+                key=f"plan_monthly_token_{plan_id}",
+            )
+            description = st.text_area("套餐说明", value=plan.get("description") or "", key=f"plan_desc_{plan_id}")
+            if st.button("保存套餐", key=f"save_plan_{plan_id}"):
+                ok = update_plan_config(
+                    plan_id,
+                    {
+                        "name": name,
+                        "price": float(price),
+                        "billing_cycle": billing_cycle,
+                        "daily_limit": int(daily_limit),
+                        "token_limit": int(token_limit),
+                        "monthly_limit": int(monthly_limit),
+                        "monthly_token_limit": int(monthly_token_limit),
+                        "description": description,
+                    },
+                )
+                if ok:
+                    st.rerun()
+
+
+def render_admin_order_management(payments, plans):
+    st.markdown("#### 订单管理")
+    search = st.text_input("搜索订单", placeholder="输入 user_id、plan_id、支付方式或状态")
+    keyword = search.strip().lower()
+    if keyword:
+        payments = [
+            payment
+            for payment in payments
+            if keyword in str(payment.get("user_id", "")).lower()
+            or keyword in str(payment.get("plan_id", "")).lower()
+            or keyword in str(payment.get("method", "")).lower()
+            or keyword in str(payment.get("status", "")).lower()
+        ]
+    st.caption(f"共 {len(payments)} 条订单")
+    name_map = plan_name_map(plans)
+    status_options = ["pending", "paid", "failed", "cancelled", "refunded"]
+
+    if not payments:
+        st.info("暂无支付订单")
+        return
+
+    for payment in payments:
+        payment_id = payment.get("id")
+        plan_id = payment.get("plan_id")
+        title = f"订单 #{payment_id} · {payment.get('user_id')} · {format_money(payment.get('amount'))}"
+        with st.expander(title):
+            st.write(f"用户：`{payment.get('user_id')}`")
+            st.write(f"套餐：{name_map.get(plan_id, plan_id)} ({plan_id})")
+            st.write(f"金额：{format_money(payment.get('amount'))}")
+            st.write(f"支付方式：{payment.get('method') or 'placeholder'}")
+            st.write(f"创建时间：{payment.get('created_at')}")
+            current_status = payment.get("status") or "pending"
+            status = st.selectbox(
+                "支付状态",
+                status_options,
+                index=status_options.index(current_status) if current_status in status_options else 0,
+                key=f"payment_status_{payment_id}",
+            )
+            if st.button("更新订单状态", key=f"payment_save_{payment_id}"):
+                if update_payment_status(payment_id, status):
+                    st.rerun()
+
+
+def render_admin_stats():
+    st.markdown("#### 数据统计")
+    col_a, col_b, col_c, col_d = st.columns(4)
+    col_a.metric("今日新增用户", load_today_user_count())
+    col_b.metric("今日聊天次数", load_today_chat_count())
+    col_c.metric("今日 Token 消耗", load_today_token_total())
+    col_d.metric("总收入", format_money(load_total_revenue()))
+
+
+def render_admin_panel():
+    if not st.session_state.get("user", {}).get("is_admin"):
+        st.error("当前账号没有管理员权限")
+        return
+
+    st.subheader("管理后台")
+    users = list_users_for_admin()
+    plans = list_plans()
+    payments = list_payments_for_admin()
+
+    user_tab, plan_tab, order_tab, stats_tab = st.tabs(["用户管理", "套餐管理", "订单管理", "数据统计"])
+    with user_tab:
+        render_admin_user_management(users, plans)
+    with plan_tab:
+        render_admin_plan_management(plans)
+    with order_tab:
+        render_admin_order_management(payments, plans)
+    with stats_tab:
+        render_admin_stats()
 
 
 def append_and_save_message(user_id, role, content, saved_content=None):
