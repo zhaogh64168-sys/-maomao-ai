@@ -12,12 +12,12 @@
 - 图片上传后自动分析
 - 输入 `记住xxx` 自动写入长期记忆
 - 输入 `忘记xxx` 自动删除相关长期记忆
-- 套餐系统：免费版、普通版、高级版
+- 套餐系统：免费版、月卡、季卡、年卡
 - 每日 / 每月使用次数限制
 - 每日 / 每月 Token 限制
 - `usage_logs` 记录每次 GPT 调用的 token 消耗
 - 支付接口预留：支付宝、微信支付按钮占位
-- 管理后台：查看用户、修改套餐和额度、禁用用户、清空聊天记录
+- 管理后台：用户管理、套餐管理、订单管理、数据统计
 
 ## Streamlit Secrets
 
@@ -159,14 +159,22 @@ end $$;
 
 create unique index if not exists plans_plan_id_unique on public.plans (plan_id);
 
+update public.users set plan_id = 'monthly', plan = 'monthly' where plan_id = 'basic' or plan = 'basic';
+update public.users set plan_id = 'yearly', plan = 'yearly' where plan_id = 'pro' or plan = 'pro';
+update public.payments set plan_id = 'monthly' where plan_id = 'basic';
+update public.payments set plan_id = 'yearly' where plan_id = 'pro';
+delete from public.plans where plan_id is null;
+delete from public.plans where plan_id in ('basic', 'pro');
+
 insert into public.plans (
   plan_id, name, price, billing_cycle,
   daily_limit, token_limit, monthly_limit, monthly_token_limit, description
 )
 values
   ('free', '免费版', 0, 'free', 20, 50000, 300, 1000000, '适合试用，每日和每月额度较低。'),
-  ('basic', '普通版', 29, 'monthly', 300, 1000000, 6000, 20000000, '适合日常高频使用。'),
-  ('pro', '高级版', 99, 'monthly', 1000, 5000000, 30000, 100000000, '适合重度使用和商业场景。')
+  ('monthly', '月卡', 29, 'monthly', 300, 1000000, 6000, 20000000, '适合日常高频使用，按月开通。'),
+  ('quarterly', '季卡', 79, 'quarterly', 600, 2500000, 15000, 60000000, '适合稳定使用，季度套餐更省心。'),
+  ('yearly', '年卡', 299, 'yearly', 1200, 6000000, 50000, 200000000, '适合长期使用和商业场景。')
 on conflict (plan_id) do update set
   name = excluded.name,
   price = excluded.price,
@@ -274,6 +282,17 @@ where email = '你的邮箱@example.com';
 
 重新登录后会看到“管理后台”。
 
+## 管理后台
+
+管理员登录后会看到“管理后台”标签页，普通用户只能看到账号信息，不能进入后台。
+
+后台包含：
+
+- 用户管理：查看所有用户、搜索用户、修改套餐、修改每日次数、修改 Token 额度、封禁用户、删除用户、清空用户聊天记录
+- 套餐管理：维护免费版、月卡、季卡、年卡，支持修改价格、计费周期、每日 / 每月次数和 Token 额度
+- 订单管理：查看支付订单、支付状态、用户购买记录，并可手动更新订单状态
+- 数据统计：今日新增用户、今日聊天次数、今日 Token 消耗、总收入
+
 ## 支付接口预留
 
 当前 `app.py` 会在点击“支付宝开通”或“微信支付开通”时向 `payments` 表写入一条 `pending` 记录：
@@ -298,7 +317,7 @@ where email = '你的邮箱@example.com';
 7. 输入 `记住我喜欢简洁回答`，确认 `memories` 写入。
 8. 刷新页面，确认聊天记录和长期记忆仍正常显示。
 9. 上传一张图片，确认会自动触发图片分析。
-10. 将该用户设置为管理员，重新登录后进入管理后台，测试修改套餐、额度、禁用用户、清空聊天记录。
+10. 将该用户设置为管理员，重新登录后进入管理后台，测试用户管理、套餐管理、订单管理和数据统计。
 
 ## 常见问题
 
