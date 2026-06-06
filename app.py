@@ -11,7 +11,7 @@ from openai import OpenAI
 
 
 MODEL_OPTIONS = ["gpt-5", "gpt-5-mini", "gpt-5-nano"]
-DEFAULT_USER_ID = "default_user"
+DEFAULT_SINGLE_USER_ID = "maomao"
 
 
 def get_secret(name, default=None):
@@ -37,7 +37,7 @@ def parse_password_config(raw_password_config):
     try:
         parsed = json.loads(raw_text)
     except json.JSONDecodeError:
-        return {DEFAULT_USER_ID: raw_text}
+        return {get_secret("APP_USER_ID", DEFAULT_SINGLE_USER_ID): raw_text}
 
     if isinstance(parsed, dict):
         users = {
@@ -48,7 +48,14 @@ def parse_password_config(raw_password_config):
         if users:
             return users
 
-    return {DEFAULT_USER_ID: raw_text}
+    return {get_secret("APP_USER_ID", DEFAULT_SINGLE_USER_ID): raw_text}
+
+
+def reset_invalid_login(users):
+    user_id = st.session_state.get("user_id")
+    if st.session_state.get("login") and user_id not in users:
+        for key in ["login", "user_id", "active_user_id", "messages", "memories"]:
+            st.session_state.pop(key, None)
 
 
 def authenticate_users(users):
@@ -292,19 +299,18 @@ def get_search_context(query, enabled):
 
 
 def record_usage(user_id, model, usage):
-    input_tokens = getattr(usage, "prompt_tokens", 0) or 0
-    output_tokens = getattr(usage, "completion_tokens", 0) or 0
-    total_tokens = getattr(usage, "total_tokens", input_tokens + output_tokens) or 0
+    prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0
+    completion_tokens = getattr(usage, "completion_tokens", 0) or 0
+    total_tokens = getattr(usage, "total_tokens", prompt_tokens + completion_tokens) or 0
 
     return db_post(
         "usage_logs",
         {
             "user_id": user_id,
             "model": model,
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
             "total_tokens": total_tokens,
-            "created_at": datetime.now(timezone.utc).isoformat(),
         },
     )
 
@@ -390,6 +396,7 @@ if not users:
     st.error("APP_PASSWORD 配置为空")
     st.stop()
 
+reset_invalid_login(users)
 authenticate_users(users)
 
 OPENAI_API_KEY = require_secret("OPENAI_API_KEY")
