@@ -12,6 +12,8 @@
 - 长期记忆 `memories`
 - 聊天记录 `chat_history`
 - 会话表 `conversations`
+- 图片生成 `image_generations`
+- 语音转文字 / 语音朗读 `audio_logs`
 - 会员套餐：免费版、月付版、年付版
 - Token 和次数限制
 - 二维码收款：支付宝 / 微信
@@ -37,6 +39,10 @@ APP_PASSWORD = "可选，兼容旧部署"
 
 ALIPAY_QR_IMAGE_URL = "https://example.com/alipay-qr.png"
 WECHAT_QR_IMAGE_URL = "https://example.com/wechat-qr.png"
+
+IMAGE_MODEL = "gpt-image-1"
+TTS_MODEL = "gpt-4o-mini-tts"
+STT_MODEL = "whisper-1"
 
 # 可选：接入 Resend 后用于发送邮箱验证码
 RESEND_API_KEY = ""
@@ -196,6 +202,39 @@ create table if not exists public.usage_logs (
 create index if not exists usage_logs_user_created_idx on public.usage_logs (user_id, created_at desc);
 create index if not exists usage_logs_created_at_idx on public.usage_logs (created_at desc);
 
+create table if not exists public.image_generations (
+  id bigint generated always as identity primary key,
+  user_id text not null,
+  prompt text,
+  model text,
+  size text,
+  image_url text,
+  created_at timestamptz default now()
+);
+alter table public.image_generations add column if not exists user_id text;
+alter table public.image_generations add column if not exists prompt text;
+alter table public.image_generations add column if not exists model text;
+alter table public.image_generations add column if not exists size text;
+alter table public.image_generations add column if not exists image_url text;
+alter table public.image_generations add column if not exists created_at timestamptz default now();
+create index if not exists image_generations_user_created_idx on public.image_generations (user_id, created_at desc);
+
+create table if not exists public.audio_logs (
+  id bigint generated always as identity primary key,
+  user_id text not null,
+  type text,
+  model text,
+  text text,
+  created_at timestamptz default now()
+);
+alter table public.audio_logs add column if not exists user_id text;
+alter table public.audio_logs add column if not exists type text;
+alter table public.audio_logs add column if not exists model text;
+alter table public.audio_logs add column if not exists text text;
+alter table public.audio_logs add column if not exists created_at timestamptz default now();
+create index if not exists audio_logs_user_created_idx on public.audio_logs (user_id, created_at desc);
+create index if not exists audio_logs_type_created_idx on public.audio_logs (type, created_at desc);
+
 create table if not exists public.payments (
   id bigint generated always as identity primary key,
   user_id text not null,
@@ -276,6 +315,8 @@ alter table public.conversations disable row level security;
 alter table public.chat_history disable row level security;
 alter table public.memories disable row level security;
 alter table public.usage_logs disable row level security;
+alter table public.image_generations disable row level security;
+alter table public.audio_logs disable row level security;
 alter table public.email_codes disable row level security;
 alter table public.password_resets disable row level security;
 alter table public.invite_codes disable row level security;
@@ -327,9 +368,11 @@ where email = '你的邮箱@example.com';
 5. 创建会话并发送消息
 6. 输入 `记住我喜欢简洁回答`，确认长期记忆写入
 7. 上传图片并追问
-8. 购买套餐，上传付款截图
-9. 管理员审核订单并开通会员
-10. 测试邀请码和推广返佣
+8. 进入“图片生成”，生成一张图片并确认 `image_generations` 和 `usage_logs` 有记录
+9. 进入“语音工具”，上传 mp3 / wav / m4a 转写，并测试朗读回答
+10. 购买套餐，上传付款截图
+11. 管理员审核订单并开通会员
+12. 测试邀请码和推广返佣
 
 ## 常见问题
 
