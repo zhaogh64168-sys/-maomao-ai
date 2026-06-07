@@ -1,0 +1,9 @@
+{
+  "framework": "nextjs",
+  "regions": ["hkg1"],
+  "functions": {
+    "app/api/[[...path]]/route.ts": {
+      "maxDuration": 60
+    }
+  }
+}
