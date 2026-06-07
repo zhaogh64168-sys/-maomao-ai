@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import hmac
+import io
 import json
 import os
 import re
@@ -15,6 +16,21 @@ from openai import OpenAI
 
 
 MODEL_OPTIONS = ["gpt-5", "gpt-5.5", "gpt-5-mini"]
+DEFAULT_IMAGE_MODEL = "gpt-image-1"
+DEFAULT_TTS_MODEL = "gpt-4o-mini-tts"
+DEFAULT_STT_MODEL = "whisper-1"
+IMAGE_SIZE_OPTIONS = {
+    "1:1": "1024x1024",
+    "16:9": "1536x1024",
+    "9:16": "1024x1536",
+}
+IMAGE_STYLE_PROMPTS = {
+    "写实摄影": "写实摄影风格，真实光影，高质量细节。",
+    "电商海报": "电商海报风格，主体突出，适合商品展示，画面干净高级。",
+    "头像": "头像风格，主体清晰，适合作为社交头像。",
+    "插画": "精致插画风格，色彩协调，构图完整。",
+    "室内设计": "室内设计效果图风格，空间层次清楚，材质真实。",
+}
 PLAN_IDS = ["free", "monthly", "yearly"]
 FREE_PLAN_ID = "free"
 DEFAULT_PLAN_ID = FREE_PLAN_ID
@@ -35,6 +51,8 @@ SUPABASE_TABLES = {
     "invite_codes",
     "referrals",
     "commissions",
+    "image_generations",
+    "audio_logs",
 }
 FALLBACK_PLANS = [
     {
@@ -769,23 +787,136 @@ def record_usage(user_id, model, usage):
     prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0
     completion_tokens = getattr(usage, "completion_tokens", 0) or 0
     total_tokens = getattr(usage, "total_tokens", prompt_tokens + completion_tokens) or 0
+    return record_usage_event(user_id, model, prompt_tokens, completion_tokens, total_tokens)
+
+
+def record_usage_event(user_id, model, prompt_tokens=0, completion_tokens=0, total_tokens=1):
     return db_insert(
         "usage_logs",
         {
             "user_id": user_id,
             "model": model,
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": total_tokens,
+            "prompt_tokens": int(prompt_tokens or 0),
+            "completion_tokens": int(completion_tokens or 0),
+            "total_tokens": int(total_tokens or 0),
             "created_at": utc_now_iso(),
         },
     )
+
+
+def configured_model(secret_name, default_model):
+    return (get_secret(secret_name, default_model) or default_model).strip()
 
 
 def encode_uploaded_image(uploaded_file):
     image_base64 = base64.b64encode(uploaded_file.getvalue()).decode("utf-8")
     mime_type = uploaded_file.type or "image/jpeg"
     return f"data:{mime_type};base64,{image_base64}", image_base64
+
+
+def image_result_to_display_url(image_item):
+    image_b64 = getattr(image_item, "b64_json", None)
+    image_url = getattr(image_item, "url", None)
+    if image_b64:
+        return f"data:image/png;base64,{image_b64}", image_b64
+    if image_url:
+        return image_url, ""
+    return "", ""
+
+
+def generate_image(user, prompt, ratio, style):
+    model = configured_model("IMAGE_MODEL", DEFAULT_IMAGE_MODEL)
+    size = IMAGE_SIZE_OPTIONS.get(ratio, IMAGE_SIZE_OPTIONS["1:1"])
+    style_prompt = IMAGE_STYLE_PROMPTS.get(style, "")
+    final_prompt = f"{style_prompt}\n\n用户提示词：{prompt}".strip()
+    try:
+        response = client.images.generate(model=model, prompt=final_prompt, size=size, n=1)
+        image_item = response.data[0] if getattr(response, "data", None) else None
+        if not image_item:
+            st.error("图片生成失败：接口没有返回图片。")
+            return None
+        image_url, image_b64 = image_result_to_display_url(image_item)
+        if not image_url:
+            st.error("图片生成失败：没有可显示的图片结果。")
+            return None
+        db_insert(
+            "image_generations",
+            {
+                "user_id": user["user_id"],
+                "prompt": prompt,
+                "model": model,
+                "size": size,
+                "image_url": image_url,
+                "created_at": utc_now_iso(),
+            },
+        )
+        record_usage_event(user["user_id"], model, prompt_tokens=len(prompt), total_tokens=1)
+        return {"url": image_url, "base64": image_b64, "model": model, "size": size}
+    except Exception as exc:
+        st.error(f"图片生成暂时不可用：{exc}")
+        return None
+
+
+def transcribe_audio(user, uploaded_audio):
+    model = configured_model("STT_MODEL", DEFAULT_STT_MODEL)
+    try:
+        audio_file = io.BytesIO(uploaded_audio.getvalue())
+        audio_file.name = uploaded_audio.name or "audio.mp3"
+        transcript = client.audio.transcriptions.create(model=model, file=audio_file)
+        text = (getattr(transcript, "text", "") or "").strip()
+        if not text:
+            st.error("语音转文字失败：没有识别到文字。")
+            return ""
+        db_insert(
+            "audio_logs",
+            {
+                "user_id": user["user_id"],
+                "type": "stt",
+                "model": model,
+                "text": text,
+                "created_at": utc_now_iso(),
+            },
+        )
+        record_usage_event(user["user_id"], model, prompt_tokens=0, completion_tokens=len(text), total_tokens=1)
+        return text
+    except Exception as exc:
+        st.error(f"语音转文字暂时不可用：{exc}")
+        return ""
+
+
+def speech_audio_bytes(response):
+    content = getattr(response, "content", None)
+    if content:
+        return content
+    if hasattr(response, "read"):
+        return response.read()
+    return bytes(response)
+
+
+def text_to_speech(user, text):
+    model = configured_model("TTS_MODEL", DEFAULT_TTS_MODEL)
+    clean_text = (text or "").strip()
+    if not clean_text:
+        st.warning("请先输入要朗读的文字。")
+        return None
+    try:
+        response = client.audio.speech.create(model=model, voice="alloy", input=clean_text[:4000])
+        audio_bytes = speech_audio_bytes(response)
+        db_insert(
+            "audio_logs",
+            {
+                "user_id": user["user_id"],
+                "type": "tts",
+                "model": model,
+                "text": clean_text[:4000],
+                "created_at": utc_now_iso(),
+            },
+        )
+        record_usage_event(user["user_id"], model, prompt_tokens=len(clean_text[:4000]), total_tokens=1)
+        return audio_bytes
+    except Exception as exc:
+        st.error(f"语音朗读暂时不可用：{exc}")
+        return None
 
 
 def get_search_context(query, enabled):
@@ -867,6 +998,106 @@ def render_upgrade_panel(user):
                     st.rerun()
 
 
+def data_url_to_bytes(data_url):
+    if not data_url or ";base64," not in data_url:
+        return None
+    return base64.b64decode(data_url.split(";base64,", 1)[1])
+
+
+def render_image_generation_page(user):
+    st.title("图片生成")
+    st.caption("输入提示词，选择比例和风格。图片生成同样会消耗会员额度。")
+    can_use, limit_message = can_use_ai(user)
+    if not can_use:
+        st.warning(limit_message)
+    cols = st.columns([0.5, 0.25, 0.25])
+    with cols[0]:
+        prompt = st.text_area("图片提示词", placeholder="例如：一只橘猫坐在复古咖啡馆窗边，阳光柔和，高级感", height=120)
+    with cols[1]:
+        ratio = st.selectbox("图片比例", list(IMAGE_SIZE_OPTIONS.keys()))
+    with cols[2]:
+        style = st.selectbox("风格", list(IMAGE_STYLE_PROMPTS.keys()))
+    if st.button("生成图片", type="primary", disabled=not can_use or not prompt.strip(), use_container_width=True):
+        with st.spinner("正在生成图片..."):
+            result = generate_image(user, prompt.strip(), ratio, style)
+        if result:
+            st.session_state.latest_generated_image = result
+    result = st.session_state.get("latest_generated_image")
+    if result:
+        st.image(result["url"], caption=f"{result['model']} / {result['size']}", use_container_width=True)
+        image_bytes = data_url_to_bytes(result["url"])
+        if image_bytes:
+            st.download_button("下载图片", image_bytes, file_name="maomao-image.png", mime="image/png", use_container_width=True)
+        else:
+            st.link_button("打开图片链接", result["url"], use_container_width=True)
+    st.divider()
+    st.subheader("最近生成")
+    rows = db_get(
+        "image_generations",
+        f"?user_id=eq.{encode_filter_value(user['user_id'])}&select=*&order=created_at.desc&limit=6",
+    )
+    if not rows:
+        st.caption("暂无图片生成记录")
+    for row in rows:
+        with st.container(border=True):
+            st.caption(f"{row.get('created_at')}  {row.get('model')}  {row.get('size')}")
+            st.write(row.get("prompt") or "")
+            if row.get("image_url"):
+                st.image(row.get("image_url"), width=260)
+
+
+def latest_assistant_answer():
+    for message in reversed(st.session_state.get("messages", [])):
+        if message.get("role") == "assistant":
+            return message.get("content") or ""
+    return ""
+
+
+def render_voice_page(user):
+    st.title("语音工具")
+    st.caption("支持 mp3、wav、m4a。语音转写和朗读都会计入会员额度。")
+    can_use, limit_message = can_use_ai(user)
+    if not can_use:
+        st.warning(limit_message)
+
+    st.subheader("语音输入")
+    uploaded_audio = st.file_uploader("上传音频文件", type=["mp3", "wav", "m4a"])
+    if uploaded_audio:
+        st.audio(uploaded_audio)
+    if st.button("转写并填入聊天输入", disabled=not can_use or not uploaded_audio, use_container_width=True):
+        with st.spinner("正在识别语音..."):
+            text = transcribe_audio(user, uploaded_audio)
+        if text:
+            st.session_state.quick_prompt = text
+            st.success("已转写，回到聊天页面即可发送或继续修改。")
+            st.text_area("转写结果", value=text, height=120)
+
+    st.divider()
+    st.subheader("语音朗读")
+    default_text = latest_assistant_answer()
+    tts_text = st.text_area("要朗读的文字", value=default_text, height=160)
+    if st.button("生成朗读音频", disabled=not can_use or not tts_text.strip(), use_container_width=True):
+        with st.spinner("正在生成语音..."):
+            audio_bytes = text_to_speech(user, tts_text)
+        if audio_bytes:
+            st.session_state.latest_tts_audio = audio_bytes
+    if st.session_state.get("latest_tts_audio"):
+        st.audio(st.session_state.latest_tts_audio, format="audio/mp3")
+
+    st.divider()
+    st.subheader("最近语音记录")
+    rows = db_get(
+        "audio_logs",
+        f"?user_id=eq.{encode_filter_value(user['user_id'])}&select=*&order=created_at.desc&limit=8",
+    )
+    if not rows:
+        st.caption("暂无语音记录")
+    for row in rows:
+        with st.container(border=True):
+            st.caption(f"{row.get('created_at')}  {row.get('type')}  {row.get('model')}")
+            st.write((row.get("text") or "")[:500])
+
+
 def open_membership(user_id, plan_id):
     plan = get_plan(plan_id)
     return db_patch(
@@ -936,7 +1167,6 @@ def cancel_payment_order(payment):
 
 
 def render_conversation_sidebar(user):
-    st.sidebar.title("毛毛AI")
     if st.sidebar.button("+ 新建对话", use_container_width=True):
         created = create_conversation(user["user_id"])
         if created:
@@ -1004,6 +1234,13 @@ def render_user_sidebar(user):
         for key in ["login", "user", "user_id", "active_conversation_id", "active_session_key", "messages", "memories"]:
             st.session_state.pop(key, None)
         st.rerun()
+
+
+def render_main_navigation(user):
+    st.sidebar.title("毛毛AI")
+    pages = ["聊天", "图片生成", "语音工具", "会员中心"]
+    pages.append("管理后台" if user.get("is_admin") else "账号")
+    return st.sidebar.radio("导航", pages, key="main_nav", label_visibility="collapsed")
 
 
 def build_openai_messages(question, uploaded_file=None, include_last_image=False):
@@ -1079,6 +1316,14 @@ def render_chat(user, conversation_id):
             if msg["role"] == "assistant":
                 with st.expander("复制回答"):
                     st.code(msg["content"], language="markdown")
+                if st.button("朗读回答", key=f"tts_answer_{idx}"):
+                    tts_can_use, tts_limit_message = can_use_ai(user)
+                    if not tts_can_use:
+                        st.warning(tts_limit_message)
+                    else:
+                        audio_bytes = text_to_speech(user, msg["content"])
+                        if audio_bytes:
+                            st.audio(audio_bytes, format="audio/mp3")
 
     can_use, limit_message = can_use_ai(user)
     if not can_use:
@@ -1324,28 +1569,32 @@ current_user = require_login()
 conversation_id = ensure_active_conversation(current_user["user_id"])
 initialize_session(current_user["user_id"], conversation_id)
 
-render_conversation_sidebar(current_user)
+current_page = render_main_navigation(current_user)
+if current_page == "聊天":
+    render_conversation_sidebar(current_user)
 render_user_sidebar(current_user)
 
-main_tab, member_tab, admin_tab = st.tabs(["聊天", "会员/支付", "管理后台" if current_user.get("is_admin") else "账号"])
-
-with main_tab:
+if current_page == "聊天":
     render_chat(current_user, conversation_id)
-
-with member_tab:
+elif current_page == "图片生成":
+    render_image_generation_page(current_user)
+elif current_page == "语音工具":
+    render_voice_page(current_user)
+elif current_page == "会员中心":
     render_upgrade_panel(current_user)
-
-with admin_tab:
+elif current_page == "管理后台":
     if current_user.get("is_admin"):
         render_admin_panel(current_user)
     else:
-        plan, daily_limit, token_limit, monthly_limit, monthly_token_limit, is_expired = effective_limits(current_user)
-        st.subheader("账号信息")
-        st.write(f"用户名：{current_user.get('username')}")
-        st.write(f"邮箱：{current_user.get('email')}")
-        st.write(f"套餐：{plan.get('name')}")
-        st.write(f"推广码：`{current_user.get('referral_code')}`")
-        st.write(f"每日次数：{daily_limit}，每日 Token：{token_limit}")
-        st.write(f"每月次数：{monthly_limit}，每月 Token：{monthly_token_limit}")
-        if is_expired:
-            st.warning("套餐已过期")
+        st.error("当前账号没有管理员权限")
+else:
+    plan, daily_limit, token_limit, monthly_limit, monthly_token_limit, is_expired = effective_limits(current_user)
+    st.subheader("账号信息")
+    st.write(f"用户名：{current_user.get('username')}")
+    st.write(f"邮箱：{current_user.get('email')}")
+    st.write(f"套餐：{plan.get('name')}")
+    st.write(f"推广码：`{current_user.get('referral_code')}`")
+    st.write(f"每日次数：{daily_limit}，每日 Token：{token_limit}")
+    st.write(f"每月次数：{monthly_limit}，每月 Token：{monthly_token_limit}")
+    if is_expired:
+        st.warning("套餐已过期")
