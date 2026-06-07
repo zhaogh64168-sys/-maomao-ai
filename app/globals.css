@@ -1,0 +1,48 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+}
+
+.dark {
+  color-scheme: dark;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: #f7f7f8;
+  color: #111827;
+}
+
+.dark body {
+  background: #0f172a;
+  color: #e5e7eb;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+textarea,
+input,
+button,
+select {
+  font: inherit;
+}
+
+.prose-chat pre {
+  overflow-x: auto;
+  border-radius: 1rem;
+  background: #111827;
+  padding: 1rem;
+  color: #f9fafb;
+}
+
+.prose-chat code {
+  border-radius: 0.35rem;
+  background: rgba(148, 163, 184, 0.16);
+  padding: 0.1rem 0.25rem;
+}
